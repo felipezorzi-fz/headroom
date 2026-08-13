@@ -107,7 +107,7 @@ headroom dashboard                      # live savings dashboard (proxy must be 
 
 To use headroom, it is recommended you launch a wrapped agent session each time so that all necessary setup is completed. When wrapping a coding agent, headroom starts a local proxy, installs **Serena** for semantic code navigation, and launches a coding agent session configured to proxy requests through headroom.
 
-Serena is registered at **user scope** (for Claude Code, in `~/.claude.json`), so it stays available in your other projects until you run `headroom unwrap`. To skip it entirely, wrap with `--code-memory none`.
+For Claude Code, Serena is registered for **the project you wrapped only** (as a `local`-scope MCP server in `~/.claude.json`), so a Serena that fails to start can never affect Claude Code sessions in your other projects. Pass `--code-memory-scope user` if you would rather have it in every session on the machine, or `--code-memory none` to skip it entirely. `headroom unwrap` removes it either way.
 
 The `headroom` CLI ships **only** via the PyPI package. The npm `headroom-ai` is the TypeScript SDK — a library you import (`import { compress } from 'headroom-ai'`), not a CLI, so it provides no `headroom` command.
 
