@@ -17,7 +17,6 @@ logger = logging.getLogger(__name__)
 _MARKER_START = "# --- Headroom MCP server ---"
 _MARKER_END = "# --- end Headroom MCP server ---"
 _MCP_CLIENT_PLUGIN = "@deepseek-ai/dsh-mcp-client"
-_HEADROOM_ENTRY_ID = "mcp-headroom"
 
 
 def _dsh_home() -> Path:
@@ -25,8 +24,13 @@ def _dsh_home() -> Path:
     return Path(os.environ.get("DSH_HOME") or Path.home() / ".dsh")
 
 
-def _spec_to_block(spec: ServerSpec) -> str:
-    """Render ``spec`` as a marker-fenced YAML ``insert`` block."""
+def _entry_id(name: str) -> str:
+    """Return the dsh patch ``insert`` id for a server name."""
+    return f"mcp-{name}"
+
+
+def _spec_to_entry(spec: ServerSpec) -> dict[str, Any]:
+    """Render a :class:`ServerSpec` as one dsh ``insert`` row."""
     config: dict[str, Any] = {
         "serverName": spec.name,
         "transport": "stdio",
@@ -35,73 +39,88 @@ def _spec_to_block(spec: ServerSpec) -> str:
     }
     if spec.env:
         config["env"] = spec.env
-    entry = {
-        "id": _HEADROOM_ENTRY_ID,
-        "name": _MCP_CLIENT_PLUGIN,
-        "config": config,
-    }
-    body = yaml.safe_dump([{"insert": [entry]}], default_flow_style=False, sort_keys=False)
+    return {"id": _entry_id(spec.name), "name": _MCP_CLIENT_PLUGIN, "config": config}
+
+
+def _entry_to_spec(entry: dict[str, Any]) -> ServerSpec | None:
+    """Parse one dsh ``insert`` row into a :class:`ServerSpec`; ``None`` if malformed."""
+    config = entry.get("config")
+    if not isinstance(config, dict):
+        return None
+    args = config.get("args")
+    if args is not None and not isinstance(args, (list, tuple)):
+        return None
+    name = config.get("serverName", "")
+    if not isinstance(name, str) or not name:
+        return None
+    env = config.get("env", {})
+    if not isinstance(env, dict):
+        env = {}
+    return ServerSpec(
+        name=name,
+        command=config.get("command", ""),
+        args=tuple(args or ()),
+        env=env,
+    )
+
+
+def _render_block(entries: list[dict[str, Any]]) -> str:
+    """Render the marker-fenced ``insert`` list holding all ``entries``."""
+    body = yaml.safe_dump([{"insert": entries}], default_flow_style=False, sort_keys=False)
     return f"{_MARKER_START}\n{body}{_MARKER_END}\n"
 
 
-def _block_to_spec(block: str) -> tuple[ServerSpec | None, str | None]:
-    """Parse a fenced block into ``(spec, corrupt_reason)``.
-
-    Returns ``(None, reason)`` when the block is present but unparsable or does
-    not contain the headroom entry — corrupt managed state that must not be
-    silently treated as "not registered".
-    """
+def _block_to_entries(block: str) -> dict[str, ServerSpec] | None:
+    """Parse a fenced block into ``{name: spec}``; ``None`` if unparsable."""
     body = block.replace(_MARKER_START, "").replace(_MARKER_END, "").strip()
     try:
         doc = yaml.safe_load(body)
-    except yaml.YAMLError as exc:
-        return None, f"malformed YAML in managed block: {exc}"
+    except yaml.YAMLError:
+        return None
     if not isinstance(doc, list):
-        return None, "managed block is not a YAML list"
+        return None
+    entries: dict[str, ServerSpec] = {}
     for op in doc:
         if not isinstance(op, dict):
             continue
         for row in op.get("insert", []):
-            if isinstance(row, dict) and row.get("id") == _HEADROOM_ENTRY_ID:
-                config = row.get("config", {})
-                return (
-                    ServerSpec(
-                        name=config.get("serverName", "headroom"),
-                        command=config.get("command", ""),
-                        args=tuple(config.get("args", [])),
-                        env=config.get("env", {}),
-                    ),
-                    None,
-                )
-    return None, "managed block does not contain the headroom entry"
+            if isinstance(row, dict) and "config" in row:
+                spec = _entry_to_spec(row)
+                if spec is None:
+                    return None
+                entries[spec.name] = spec
+    return entries
 
 
 @dataclass
 class _ManagedBlock:
     """Read-back of the marker-fenced block in ``cordis.patch.yml``.
 
-    ``spec`` set → block present and clean; ``corrupt`` set → block present but
-    broken; both ``None`` → no block.
+    ``entries`` set → block present and clean (may be empty); ``corrupt`` set →
+    block present but broken; ``entries`` is ``{}`` and ``corrupt`` is ``None``
+    when absent.
     """
 
-    spec: ServerSpec | None
+    entries: dict[str, ServerSpec] | None
     corrupt: str | None
 
 
 def _read_managed_block(config_file: Path) -> _ManagedBlock:
     """Read the managed block, distinguishing absent / clean / corrupt."""
     if not config_file.exists():
-        return _ManagedBlock(None, None)
+        return _ManagedBlock({}, None)
     text = config_file.read_text(encoding="utf-8")
     if _MARKER_START not in text:
-        return _ManagedBlock(None, None)
+        return _ManagedBlock({}, None)
     start = text.index(_MARKER_START)
     end_marker = text.find(_MARKER_END, start)
     if end_marker == -1:
         return _ManagedBlock(None, "unterminated start marker (missing end marker)")
     block = text[start : end_marker + len(_MARKER_END)]
-    spec, corrupt = _block_to_spec(block)
-    return _ManagedBlock(spec, corrupt)
+    entries = _block_to_entries(block)
+    if entries is None:
+        return _ManagedBlock(None, "malformed YAML in managed block")
+    return _ManagedBlock(entries, None)
 
 
 def _remove_managed_block(text: str) -> str:
@@ -159,7 +178,10 @@ class DshRegistrar(MCPRegistrar):
     def get_server(self, server_name: str) -> ServerSpec | None:
         if server_name != "headroom":
             return None
-        return _read_managed_block(self._config_file).spec
+        managed = _read_managed_block(self._config_file)
+        if managed.entries is None:
+            return None
+        return managed.entries.get("headroom")
 
     def register_server(self, spec: ServerSpec, *, force: bool = False) -> RegisterResult:
         if not self.detect():
@@ -174,18 +196,22 @@ class DshRegistrar(MCPRegistrar):
                     f"corrupt managed block in {self._config_file}: {managed.corrupt}; "
                     "re-run with --force to overwrite",
                 )
-        elif managed.spec is not None:
-            if _specs_equivalent(managed.spec, spec):
-                return RegisterResult(
-                    RegisterStatus.ALREADY, f"already registered in {self._config_file}"
-                )
-            if not force:
-                return RegisterResult(RegisterStatus.MISMATCH, _diff_specs(managed.spec, spec))
+        elif managed.entries is not None:
+            existing = managed.entries.get(spec.name)
+            if existing is not None:
+                if _specs_equivalent(existing, spec):
+                    return RegisterResult(
+                        RegisterStatus.ALREADY, f"already registered in {self._config_file}"
+                    )
+                if not force:
+                    return RegisterResult(
+                        RegisterStatus.MISMATCH, _diff_specs(existing, spec)
+                    )
         # Absent, or (corrupt | mismatch) with force: rewrite atomically.
-        existing = (
+        existing_text = (
             self._config_file.read_text(encoding="utf-8") if self._config_file.exists() else ""
         )
-        new_text = _remove_managed_block(existing) + _spec_to_block(spec)
+        new_text = _remove_managed_block(existing_text) + _render_block([_spec_to_entry(spec)])
         try:
             self._config_file.parent.mkdir(parents=True, exist_ok=True)
             _atomic_write(self._config_file, new_text)

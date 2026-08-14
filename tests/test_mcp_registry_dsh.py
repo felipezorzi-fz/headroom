@@ -7,7 +7,12 @@ from pathlib import Path
 import pytest
 
 from headroom.mcp_registry.base import RegisterStatus, ServerSpec
-from headroom.mcp_registry.dsh import DshRegistrar
+from headroom.mcp_registry.dsh import (
+    DshRegistrar,
+    _block_to_entries,
+    _render_block,
+    _spec_to_entry,
+)
 from headroom.mcp_registry.install import get_all_registrars
 
 
@@ -158,3 +163,26 @@ def test_unregister_truncated_block_preserves_unrelated(
     )
     assert DshRegistrar().unregister_server("headroom") is True
     assert patch.read_text(encoding="utf-8") == unrelated
+
+
+def test_block_round_trips_multiple_servers() -> None:
+    headroom = _spec()
+    serena = _spec(name="serena", command="uvx", args=("--from", "serena-agent"))
+    block = _render_block([_spec_to_entry(headroom), _spec_to_entry(serena)])
+    entries = _block_to_entries(block)
+    assert entries is not None
+    assert set(entries) == {"headroom", "serena"}
+    assert entries["headroom"].command == "headroom"
+    assert entries["serena"].command == "uvx"
+
+
+def test_block_with_malformed_config_row_is_corrupt() -> None:
+    block = (
+        "# --- Headroom MCP server ---\n"
+        "- insert:\n"
+        "  - id: mcp-headroom\n"
+        "    name: '@deepseek-ai/dsh-mcp-client'\n"
+        "    config: null\n"
+        "# --- end Headroom MCP server ---\n"
+    )
+    assert _block_to_entries(block) is None
