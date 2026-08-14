@@ -1,0 +1,160 @@
+"""Tests for the DeepSeek Harness (dsh) MCP registrar."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from headroom.mcp_registry.base import RegisterStatus, ServerSpec
+from headroom.mcp_registry.dsh import DshRegistrar
+from headroom.mcp_registry.install import get_all_registrars
+
+
+def _spec(**overrides) -> ServerSpec:
+    base = ServerSpec(name="headroom", command="headroom", args=("mcp", "serve"))
+    for key, value in overrides.items():
+        setattr(base, key, value)
+    return base
+
+
+def test_detects_dsh_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DSH_HOME", str(tmp_path))
+    assert DshRegistrar().detect() is True
+
+
+def test_not_detected_without_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DSH_HOME", str(tmp_path / "missing"))
+    monkeypatch.setenv("HOME", str(tmp_path / "nohome"))
+    assert DshRegistrar().detect() is False
+
+
+def test_register_writes_patch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    home = tmp_path / "dsh"
+    home.mkdir()
+    monkeypatch.setenv("DSH_HOME", str(home))
+    result = DshRegistrar().register_server(_spec())
+    assert result.status is RegisterStatus.REGISTERED
+    text = (home / "cordis.patch.yml").read_text(encoding="utf-8")
+    assert "@deepseek-ai/dsh-mcp-client" in text
+    assert "serverName: headroom" in text
+    assert "transport: stdio" in text
+
+
+def test_register_is_idempotent(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    home = tmp_path / "dsh"
+    home.mkdir()
+    monkeypatch.setenv("DSH_HOME", str(home))
+    reg = DshRegistrar()
+    assert reg.register_server(_spec()).status is RegisterStatus.REGISTERED
+    assert reg.register_server(_spec()).status is RegisterStatus.ALREADY
+
+
+def test_mismatch_leaves_existing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    home = tmp_path / "dsh"
+    home.mkdir()
+    monkeypatch.setenv("DSH_HOME", str(home))
+    reg = DshRegistrar()
+    reg.register_server(_spec())
+    before = (home / "cordis.patch.yml").read_text(encoding="utf-8")
+    result = reg.register_server(_spec(command="other-headroom"))
+    assert result.status is RegisterStatus.MISMATCH
+    assert (home / "cordis.patch.yml").read_text(encoding="utf-8") == before
+
+
+def test_unregister_removes_only_headroom(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    home = tmp_path / "dsh"
+    home.mkdir()
+    monkeypatch.setenv("DSH_HOME", str(home))
+    patch = home / "cordis.patch.yml"
+    patch.write_text(
+        "- insert:\n    - id: user-plugin\n      name: '@deepseek-ai/other'\n", encoding="utf-8"
+    )
+    reg = DshRegistrar()
+    reg.register_server(_spec())
+    assert reg.unregister_server("headroom") is True
+    text = patch.read_text(encoding="utf-8")
+    assert "headroom" not in text
+    assert "user-plugin" in text
+
+
+def test_registry_includes_dsh() -> None:
+    assert any(reg.name == "dsh" for reg in get_all_registrars())
+
+
+def test_register_fails_on_truncated_block(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home = tmp_path / "dsh"
+    home.mkdir()
+    monkeypatch.setenv("DSH_HOME", str(home))
+    patch = home / "cordis.patch.yml"
+    truncated = "# --- Headroom MCP server ---\n"
+    patch.write_text(truncated, encoding="utf-8")
+    result = DshRegistrar().register_server(_spec())
+    assert result.status is RegisterStatus.FAILED
+    assert "unterminated" in (result.detail or "")
+    assert patch.read_text(encoding="utf-8") == truncated
+
+
+def test_register_fails_on_malformed_yaml_block(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home = tmp_path / "dsh"
+    home.mkdir()
+    monkeypatch.setenv("DSH_HOME", str(home))
+    patch = home / "cordis.patch.yml"
+    malformed = (
+        "# --- Headroom MCP server ---\n"
+        "- insert: [unclosed\n"
+        "# --- end Headroom MCP server ---\n"
+    )
+    patch.write_text(malformed, encoding="utf-8")
+    result = DshRegistrar().register_server(_spec())
+    assert result.status is RegisterStatus.FAILED
+    assert patch.read_text(encoding="utf-8") == malformed
+
+
+def test_force_overwrites_truncated_block(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home = tmp_path / "dsh"
+    home.mkdir()
+    monkeypatch.setenv("DSH_HOME", str(home))
+    patch = home / "cordis.patch.yml"
+    patch.write_text("# --- Headroom MCP server ---\n", encoding="utf-8")
+    result = DshRegistrar().register_server(_spec(), force=True)
+    assert result.status is RegisterStatus.REGISTERED
+    text = patch.read_text(encoding="utf-8")
+    assert text.count("# --- Headroom MCP server ---") == 1
+    assert "@deepseek-ai/dsh-mcp-client" in text
+
+
+def test_unregister_preserves_unrelated_bytes_exactly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home = tmp_path / "dsh"
+    home.mkdir()
+    monkeypatch.setenv("DSH_HOME", str(home))
+    patch = home / "cordis.patch.yml"
+    unrelated = "- insert:\n    - id: user-plugin\n      name: '@deepseek-ai/other'\n"
+    patch.write_text(unrelated, encoding="utf-8")
+    reg = DshRegistrar()
+    assert reg.register_server(_spec()).status is RegisterStatus.REGISTERED
+    assert reg.unregister_server("headroom") is True
+    assert patch.read_text(encoding="utf-8") == unrelated
+
+
+def test_unregister_truncated_block_preserves_unrelated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home = tmp_path / "dsh"
+    home.mkdir()
+    monkeypatch.setenv("DSH_HOME", str(home))
+    patch = home / "cordis.patch.yml"
+    unrelated = "- insert:\n    - id: user-plugin\n      name: '@deepseek-ai/other'\n"
+    patch.write_text(
+        unrelated + "# --- Headroom MCP server ---\n- insert:\n", encoding="utf-8"
+    )
+    assert DshRegistrar().unregister_server("headroom") is True
+    assert patch.read_text(encoding="utf-8") == unrelated
