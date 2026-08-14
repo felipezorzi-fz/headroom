@@ -7462,6 +7462,8 @@ def opencode(
 )
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.option("--prepare-only", is_flag=True, hidden=True)
+@_serena_instructions_option
+@_code_memory_option
 @click.argument("dsh_args", nargs=-1, type=click.UNPROCESSED)
 def dsh(
     port: int,
@@ -7501,6 +7503,10 @@ def dsh(
         raise SystemExit(1) from exc
 
     env, env_vars_display = build_launch_env(port, os.environ)
+
+    from headroom.mcp_registry import DshRegistrar
+
+    _setup_coding_compressor(DshRegistrar(), serena_context="agent", verbose=verbose)
 
     _launch_tool(
         binary=argv[0],

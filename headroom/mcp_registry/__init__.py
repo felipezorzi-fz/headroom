@@ -17,6 +17,7 @@ from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 from .claude import ClaudeRegistrar
 from .codex import CodexRegistrar
 from .display import any_succeeded, format_result, format_results
+from .dsh import DshRegistrar
 from .grok import GrokRegistrar
 from .install import (
     DEFAULT_PROXY_URL,
@@ -32,6 +33,7 @@ __all__ = [
     "DEFAULT_PROXY_URL",
     "ClaudeRegistrar",
     "CodexRegistrar",
+    "DshRegistrar",
     "GrokRegistrar",
     "MCPRegistrar",
     "OpencodeRegistrar",
