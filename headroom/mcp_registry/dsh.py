@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import yaml
+import yaml  # type: ignore[import-untyped]
 
 from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 
@@ -176,12 +176,10 @@ class DshRegistrar(MCPRegistrar):
         return _dsh_home().exists()
 
     def get_server(self, server_name: str) -> ServerSpec | None:
-        if server_name != "headroom":
-            return None
         managed = _read_managed_block(self._config_file)
         if managed.entries is None:
             return None
-        return managed.entries.get("headroom")
+        return managed.entries.get(server_name)
 
     def register_server(self, spec: ServerSpec, *, force: bool = False) -> RegisterResult:
         if not self.detect():
@@ -196,22 +194,24 @@ class DshRegistrar(MCPRegistrar):
                     f"corrupt managed block in {self._config_file}: {managed.corrupt}; "
                     "re-run with --force to overwrite",
                 )
-        elif managed.entries is not None:
-            existing = managed.entries.get(spec.name)
-            if existing is not None:
-                if _specs_equivalent(existing, spec):
-                    return RegisterResult(
-                        RegisterStatus.ALREADY, f"already registered in {self._config_file}"
-                    )
-                if not force:
-                    return RegisterResult(
-                        RegisterStatus.MISMATCH, _diff_specs(existing, spec)
-                    )
-        # Absent, or (corrupt | mismatch) with force: rewrite atomically.
+            managed = _ManagedBlock({}, None)
+        entries = managed.entries or {}
+        existing = entries.get(spec.name)
+        if existing is not None:
+            if _specs_equivalent(existing, spec):
+                return RegisterResult(
+                    RegisterStatus.ALREADY, f"already registered in {self._config_file}"
+                )
+            if not force:
+                return RegisterResult(RegisterStatus.MISMATCH, _diff_specs(existing, spec))
+        entries = dict(entries)
+        entries[spec.name] = spec
         existing_text = (
             self._config_file.read_text(encoding="utf-8") if self._config_file.exists() else ""
         )
-        new_text = _remove_managed_block(existing_text) + _render_block([_spec_to_entry(spec)])
+        new_text = _remove_managed_block(existing_text) + _render_block(
+            [_spec_to_entry(s) for s in entries.values()]
+        )
         try:
             self._config_file.parent.mkdir(parents=True, exist_ok=True)
             _atomic_write(self._config_file, new_text)
@@ -222,12 +222,20 @@ class DshRegistrar(MCPRegistrar):
         return RegisterResult(RegisterStatus.REGISTERED, f"wrote to {self._config_file}")
 
     def unregister_server(self, server_name: str) -> bool:
-        if server_name != "headroom":
-            return False
         if not self._config_file.exists():
             return True
         text = self._config_file.read_text(encoding="utf-8")
         if _MARKER_START not in text:
             return True
-        _atomic_write(self._config_file, _remove_managed_block(text))
+        managed = _read_managed_block(self._config_file)
+        if managed.corrupt is not None or managed.entries is None:
+            _atomic_write(self._config_file, _remove_managed_block(text))
+            return True
+        if server_name not in managed.entries:
+            return True
+        entries = {k: v for k, v in managed.entries.items() if k != server_name}
+        new_text = _remove_managed_block(text)
+        if entries:
+            new_text += _render_block([_spec_to_entry(s) for s in entries.values()])
+        _atomic_write(self._config_file, new_text)
         return True

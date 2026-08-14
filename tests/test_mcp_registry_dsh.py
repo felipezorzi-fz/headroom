@@ -87,9 +87,7 @@ def test_registry_includes_dsh() -> None:
     assert any(reg.name == "dsh" for reg in get_all_registrars())
 
 
-def test_register_fails_on_truncated_block(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_register_fails_on_truncated_block(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     home = tmp_path / "dsh"
     home.mkdir()
     monkeypatch.setenv("DSH_HOME", str(home))
@@ -110,9 +108,7 @@ def test_register_fails_on_malformed_yaml_block(
     monkeypatch.setenv("DSH_HOME", str(home))
     patch = home / "cordis.patch.yml"
     malformed = (
-        "# --- Headroom MCP server ---\n"
-        "- insert: [unclosed\n"
-        "# --- end Headroom MCP server ---\n"
+        "# --- Headroom MCP server ---\n- insert: [unclosed\n# --- end Headroom MCP server ---\n"
     )
     patch.write_text(malformed, encoding="utf-8")
     result = DshRegistrar().register_server(_spec())
@@ -120,9 +116,7 @@ def test_register_fails_on_malformed_yaml_block(
     assert patch.read_text(encoding="utf-8") == malformed
 
 
-def test_force_overwrites_truncated_block(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_force_overwrites_truncated_block(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     home = tmp_path / "dsh"
     home.mkdir()
     monkeypatch.setenv("DSH_HOME", str(home))
@@ -158,9 +152,7 @@ def test_unregister_truncated_block_preserves_unrelated(
     monkeypatch.setenv("DSH_HOME", str(home))
     patch = home / "cordis.patch.yml"
     unrelated = "- insert:\n    - id: user-plugin\n      name: '@deepseek-ai/other'\n"
-    patch.write_text(
-        unrelated + "# --- Headroom MCP server ---\n- insert:\n", encoding="utf-8"
-    )
+    patch.write_text(unrelated + "# --- Headroom MCP server ---\n- insert:\n", encoding="utf-8")
     assert DshRegistrar().unregister_server("headroom") is True
     assert patch.read_text(encoding="utf-8") == unrelated
 
@@ -186,3 +178,39 @@ def test_block_with_malformed_config_row_is_corrupt() -> None:
         "# --- end Headroom MCP server ---\n"
     )
     assert _block_to_entries(block) is None
+
+
+def test_register_two_servers_and_unregister_one_preserves_the_other(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home = tmp_path / "dsh"
+    home.mkdir()
+    monkeypatch.setenv("DSH_HOME", str(home))
+    reg = DshRegistrar()
+    assert reg.register_server(_spec()).status is RegisterStatus.REGISTERED
+    serena = _spec(name="serena", command="uvx", args=("--from", "serena-agent"))
+    assert reg.register_server(serena).status is RegisterStatus.REGISTERED
+
+    assert reg.get_server("headroom") is not None
+    assert reg.get_server("serena") is not None
+
+    assert reg.unregister_server("serena") is True
+    assert reg.get_server("serena") is None
+    assert reg.get_server("headroom") is not None
+    text = (home / "cordis.patch.yml").read_text(encoding="utf-8")
+    assert "serena" not in text
+    assert "mcp-headroom" in text
+
+
+def test_register_two_servers_is_idempotent_per_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home = tmp_path / "dsh"
+    home.mkdir()
+    monkeypatch.setenv("DSH_HOME", str(home))
+    reg = DshRegistrar()
+    serena = _spec(name="serena", command="uvx", args=("--from", "serena-agent"))
+    assert reg.register_server(_spec()).status is RegisterStatus.REGISTERED
+    assert reg.register_server(serena).status is RegisterStatus.REGISTERED
+    assert reg.register_server(_spec()).status is RegisterStatus.ALREADY
+    assert reg.register_server(serena).status is RegisterStatus.ALREADY
