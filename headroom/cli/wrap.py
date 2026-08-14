@@ -7937,7 +7937,27 @@ def unwrap_omp(port: int, no_stop_proxy: bool) -> None:
 )
 @click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
 def unwrap_dsh(port: int, no_stop_proxy: bool) -> None:
-    """Undo ``headroom wrap dsh`` (stop the local proxy)."""
+    """Undo ``headroom wrap dsh`` (remove MCP entries and stop the proxy)."""
+    from headroom.mcp_registry import DshRegistrar
+
+    registrar = DshRegistrar()
+    removed_any = False
+    if registrar.detect():
+        serena_status = _remove_headroom_installed_serena_mcp(registrar)
+        if serena_status == "removed":
+            click.echo("  Removed Headroom-installed Serena MCP server from dsh.")
+            removed_any = True
+        elif serena_status == "failed":
+            click.echo("  Serena MCP server matched Headroom ledger but could not be removed.")
+
+        headroom_present = registrar.get_server("headroom") is not None
+        if registrar.unregister_server("headroom") and headroom_present:
+            click.echo("  Removed Headroom MCP server from dsh config.")
+            removed_any = True
+
+    if not removed_any:
+        click.echo("  Nothing to undo: no Headroom MCP markers found.")
+
     if not no_stop_proxy:
         _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
 
