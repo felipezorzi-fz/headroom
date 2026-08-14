@@ -214,3 +214,17 @@ def test_register_two_servers_is_idempotent_per_name(
     assert reg.register_server(serena).status is RegisterStatus.REGISTERED
     assert reg.register_server(_spec()).status is RegisterStatus.ALREADY
     assert reg.register_server(serena).status is RegisterStatus.ALREADY
+
+
+def test_register_starts_block_on_new_line_when_file_lacks_trailing_newline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home = tmp_path / "dsh"
+    home.mkdir()
+    monkeypatch.setenv("DSH_HOME", str(home))
+    patch = home / "cordis.patch.yml"
+    patch.write_text("- id: webserver\n  config:\n    port: 3080", encoding="utf-8")
+    assert DshRegistrar().register_server(_spec()).status is RegisterStatus.REGISTERED
+    text = patch.read_text(encoding="utf-8")
+    assert "3080\n# --- Headroom MCP server ---" in text
+    assert "3080# --- Headroom MCP server ---" not in text

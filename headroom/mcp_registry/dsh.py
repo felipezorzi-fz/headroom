@@ -209,9 +209,10 @@ class DshRegistrar(MCPRegistrar):
         existing_text = (
             self._config_file.read_text(encoding="utf-8") if self._config_file.exists() else ""
         )
-        new_text = _remove_managed_block(existing_text) + _render_block(
-            [_spec_to_entry(s) for s in entries.values()]
-        )
+        base = _remove_managed_block(existing_text)
+        if base and not base.endswith("\n"):
+            base += "\n"
+        new_text = base + _render_block([_spec_to_entry(s) for s in entries.values()])
         try:
             self._config_file.parent.mkdir(parents=True, exist_ok=True)
             _atomic_write(self._config_file, new_text)
@@ -236,6 +237,8 @@ class DshRegistrar(MCPRegistrar):
         entries = {k: v for k, v in managed.entries.items() if k != server_name}
         new_text = _remove_managed_block(text)
         if entries:
+            if new_text and not new_text.endswith("\n"):
+                new_text += "\n"
             new_text += _render_block([_spec_to_entry(s) for s in entries.values()])
         _atomic_write(self._config_file, new_text)
         return True
