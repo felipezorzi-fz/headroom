@@ -46,6 +46,23 @@ from headroom.proxy.outcome import RequestOutcome
 logger = logging.getLogger("headroom.proxy")
 
 
+def _is_anthropic_upstream(url: str | None) -> bool:
+    """Whether this upstream is Anthropic's own API (or unset, which means it).
+
+    Host-based rather than a prefix match, so a lookalike host cannot pass by
+    embedding the real one in a path or userinfo segment.
+    """
+    if not url:
+        return True
+    try:
+        from urllib.parse import urlsplit
+
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return host == "api.anthropic.com" or host.endswith(".anthropic.com")
+
+
 class _AnthropicTurnHookUsage:
     """Usage from hook-triggered Anthropic calls the main response omits.
 
@@ -2739,6 +2756,14 @@ class AnthropicHandlerMixin:
             # Anthropic-compatible gateways reject that shape, so third-party routes
             # strip client-originated tool_search_tool_* entries above and skip
             # Headroom's own injector here.
+            #
+            # Pointing this wire at GitHub Copilot counts as custom, which is what
+            # `wrap copilot --native` and the VS Code CAPI redirect both do so that
+            # Claude models work there. Those requests still arrive as provider
+            # "anthropic", and before this guard existed the deferral fired against
+            # an API that does not implement it: VS Code Copilot Chat lost all ~200
+            # of its tools, because the core-tool allowlist is Claude Code's names
+            # and matches none of VS Code's.
             if (
                 provider_name == "anthropic"
                 and anthropic_first_party_tool_search_supported(_anthropic_target_base_url)
@@ -3290,6 +3315,46 @@ class AnthropicHandlerMixin:
             )
             if upstream_base_url and request.url.query:
                 url = f"{url}?{request.url.query}"
+
+            # Never hand an Anthropic key to a non-Anthropic host.
+            #
+            # One proxy has one default destination for this wire, so a proxy
+            # pinned at Copilot (what `wrap copilot --native` needs, and what the
+            # shared Copilot CLI + VS Code proxy uses) would forward this
+            # client's `x-api-key` straight to GitHub -- the key is passed
+            # through unchanged. `wrap claude` pins its own upstream per request
+            # to avoid that; this is the backstop for anything that does not,
+            # so a dropped header degrades to a clear local error instead of a
+            # silent credential disclosure.
+            #
+            # Copilot's own clients authenticate with `Authorization`, never
+            # `x-api-key`, so this cannot fire on the traffic the pin exists for.
+            if (
+                not upstream_base_url
+                and headers.get("x-api-key")
+                and not headers.get("authorization")
+                and not _is_anthropic_upstream(self.ANTHROPIC_API_URL)
+            ):
+                logger.error(
+                    "Refusing to forward an Anthropic x-api-key to non-Anthropic upstream %s",
+                    self.ANTHROPIC_API_URL,
+                )
+                return JSONResponse(
+                    status_code=502,
+                    content={
+                        "type": "error",
+                        "error": {
+                            "type": "api_error",
+                            "message": (
+                                "This Headroom proxy's Anthropic upstream is "
+                                f"{self.ANTHROPIC_API_URL}, not Anthropic, so forwarding your "
+                                "x-api-key would disclose it to another vendor. Use a proxy "
+                                "port of your own, or send "
+                                "'X-Headroom-Base-Url: https://api.anthropic.com'."
+                            ),
+                        },
+                    },
+                )
 
             try:
                 ccr_handler_config = getattr(self.ccr_response_handler, "config", None)

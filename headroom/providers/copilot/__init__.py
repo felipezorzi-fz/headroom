@@ -8,6 +8,7 @@ from .vscode import (
     vscode_user_dir,
 )
 from .wrap import (
+    VSCODE_MODEL_ID_PREFIX,
     build_launch_env,
     copilot_model_from_args,
     default_wire_api_for_model,
@@ -23,6 +24,7 @@ from .wrap import (
 )
 
 __all__ = [
+    "VSCODE_MODEL_ID_PREFIX",
     "build_launch_env",
     "copilot_model_from_args",
     "default_wire_api_for_model",

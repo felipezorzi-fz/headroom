@@ -20,6 +20,7 @@ Usage:
 from __future__ import annotations
 
 import errno
+import hashlib
 import importlib.util
 import io
 import json
@@ -32,7 +33,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
@@ -1768,6 +1769,358 @@ def _inject_serena_instructions(file_path: Path, verbose: bool = False) -> bool:
     return True
 
 
+_COPILOT_MODELS_MARKER = "<!-- headroom:available-models -->"
+_COPILOT_MODELS_MARKER_END = "<!-- /headroom:available-models -->"
+
+
+def _copilot_models_instructions_block(model_lines: list[str]) -> str:
+    """Build the marker-guarded available-models block for Copilot instructions.
+
+    Why this is needed: ``wrap copilot`` uses the CLI's BYOK provider override
+    (its only interposition hook), and BYOK is single-model -- it replaces
+    Copilot's own model routing, so the CLI knows about exactly the one model it
+    was launched with. Native Copilot knows the full set and picks correctly;
+    under BYOK the agent has nothing to consult, so when asked to "use a
+    different model" it invents names from training memory or scrapes them out
+    of repo files. Observed live: an agent listed ``claude-fable-5``,
+    ``claude-opus-4.8-fast`` and ``grok-4.5`` as available -- none are Copilot
+    models -- mixed in with real ones, which is exactly the "sometimes right,
+    sometimes deprecated" behaviour users report.
+
+    Giving the agent the real list restores parity with native Copilot. The
+    ``headroom models`` pointer matters as much as the list: the block is
+    written at launch, so the command is what keeps the answer current if
+    GitHub's catalog shifts mid-session.
+    """
+    listing = "\n".join(f"- `{line}`" for line in model_lines)
+    return f"""\
+{_COPILOT_MODELS_MARKER}
+# Available AI models (Headroom)
+
+This session runs through Headroom, which uses Copilot's BYOK transport. That
+transport is single-model, so the model picker shows only the launch model and
+**your own knowledge of model names is not a reliable guide** — names from
+training data are frequently retired or belong to another product.
+
+**The models below are the ones this account can actually use.** Use these IDs
+verbatim when choosing a model for a subagent or when asked to use a different
+model or vendor. Do not invent, guess, or abbreviate them, and do not scrape
+model names out of repository files.
+
+{listing}
+
+To re-check the current list at any time (authoritative, live):
+
+```
+headroom models            # all available models
+headroom models --json     # machine-readable
+```
+
+If a model you want is not listed, it is not available on this account — say so
+rather than substituting a similar-sounding name.
+{_COPILOT_MODELS_MARKER_END}
+"""
+
+
+def _live_copilot_models_payload(api_url: str | None, token: str | None) -> dict:
+    """Raw ``GET /models`` body, or ``{}`` on any failure.
+
+    Returns the payload rather than parsed cards because VS Code needs
+    per-model capabilities (tool calling, vision) that ``ModelCard`` does not
+    carry, and that dataclass belongs to a separate change.
+    """
+    if not api_url or not token:
+        return {}
+    try:
+        import httpx
+
+        from headroom.copilot_auth import _copilot_chat_header_defaults
+
+        response = httpx.get(
+            f"{api_url.rstrip('/')}/models",
+            headers={"Authorization": f"Bearer {token}", **_copilot_chat_header_defaults()},
+            timeout=10,
+        )
+        if response.status_code != 200:
+            return {}
+        payload = response.json()
+    except Exception:  # noqa: BLE001 — discovery is best-effort, never fatal
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _live_copilot_model_ids(api_url: str | None, token: str | None) -> list[str]:
+    """Selectable Copilot chat model IDs, live. Empty list on any failure."""
+    if not api_url or not token:
+        return []
+    try:
+        import httpx
+
+        from headroom.copilot_auth import _copilot_chat_header_defaults
+        from headroom.models.copilot_catalog import parse_models_payload
+
+        response = httpx.get(
+            f"{api_url.rstrip('/')}/models",
+            headers={"Authorization": f"Bearer {token}", **_copilot_chat_header_defaults()},
+            timeout=8,
+        )
+        if response.status_code != 200:
+            return []
+        cards = parse_models_payload(response.json())
+    except Exception:  # noqa: BLE001 — guidance is best-effort, never fatal
+        return []
+    return sorted(
+        (c.id for c in cards.values() if c.is_chat_model and c.selectable),
+        key=lambda mid: (mid.split("-")[0], mid),
+    )
+
+
+def _copilot_models_provenance_path(file_path: Path) -> Path:
+    """Sidecar recording the exact block Headroom last wrote to ``file_path``.
+
+    Kept in Headroom's own workspace, not in the user's file: **nothing inside the
+    instruction file can prove ownership.** Marker text cannot (a user may quote a
+    complete pair while documenting the feature), and neither can a signature line
+    inside the block -- a user quoting the block quotes its heading too. Both were
+    reproduced destroying real user content. Out-of-band provenance is the only
+    signal a user's prose cannot forge.
+    """
+    from headroom import paths
+
+    digest = hashlib.sha256(str(file_path.resolve()).encode("utf-8", "replace")).hexdigest()[:16]
+    return paths.workspace_dir() / "copilot_model_blocks" / f"{digest}.json"
+
+
+def _record_copilot_models_provenance(file_path: Path, block: str) -> None:
+    """Remember the exact bytes written, so a later launch can prove ownership."""
+    try:
+        record = _copilot_models_provenance_path(file_path)
+        record.parent.mkdir(parents=True, exist_ok=True)
+        _write_text(
+            record,
+            json.dumps(
+                {
+                    "path": str(file_path),
+                    "sha256": hashlib.sha256(block.encode("utf-8")).hexdigest(),
+                }
+            ),
+        )
+    except OSError:
+        # Provenance is an optimisation for *refreshing*. Losing it only means the
+        # next launch appends instead of replacing -- never that user text is cut.
+        pass
+
+
+def _copilot_models_provenance(file_path: Path) -> str | None:
+    """SHA-256 of the block Headroom last wrote here, or ``None``."""
+    try:
+        rec = json.loads(_read_text(_copilot_models_provenance_path(file_path)))
+    except (OSError, ValueError):
+        return None
+    sha = rec.get("sha256") if isinstance(rec, dict) else None
+    return sha if isinstance(sha, str) and sha else None
+
+
+def _clear_copilot_models_provenance(file_path: Path) -> None:
+    try:
+        _copilot_models_provenance_path(file_path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _marked_block_spans(existing: str) -> list[tuple[int, int]]:
+    """Every complete ``START ... END`` pair, tightest-first, in file order.
+
+    Iterates **END markers** and pairs each with the *nearest preceding* START.
+    Pairing the other way round (first START, then the next END) produces a span
+    that swallows everything between an unpaired stray START and a later real
+    block -- and because the real block then sits inside that span, an ownership
+    check on its contents still passes, so the user's text is deleted anyway.
+    Taking the nearest START yields the narrowest defensible pair instead.
+    """
+    spans: list[tuple[int, int]] = []
+    search_from = 0
+    while True:
+        end = existing.find(_COPILOT_MODELS_MARKER_END, search_from)
+        if end < 0:
+            return spans
+        end_stop = end + len(_COPILOT_MODELS_MARKER_END)
+        start = existing.rfind(_COPILOT_MODELS_MARKER, search_from, end)
+        if start >= 0:
+            spans.append((start, end_stop))
+        search_from = end_stop
+
+
+def _owned_marked_block_spans(existing: str, file_path: Path) -> list[tuple[int, int]]:
+    """Spans whose bytes Headroom can **prove** it wrote, by recorded digest.
+
+    Every content-based rule tried before this destroyed real user text, because
+    each was forgeable by a user writing about the feature:
+
+    * ``index(END)`` with no offset matched the first END anywhere in the file.
+    * END forward from the first START swallowed text before a real block.
+    * First END + nearest preceding START selected a *complete* pair the user had
+      documented above ours.
+    * A signature line inside the span -- a user quoting the block quotes its
+      heading too, and prose merely *mentioning* both markers and the heading was
+      spliced away (``NEVER COMMIT SECRETS`` deleted in a two-line file).
+
+    So ownership is a byte-level identity check against an out-of-band record.
+    Anything we cannot prove we wrote is treated as the user's, and the caller
+    appends instead of splicing. Appending a visible duplicate is a recoverable
+    annoyance; cutting a span out of someone's instructions file is not.
+    """
+    expected = _copilot_models_provenance(file_path)
+    if expected is None:
+        return []
+    return [
+        (start, end)
+        for start, end in _marked_block_spans(existing)
+        if hashlib.sha256(existing[start:end].encode("utf-8")).hexdigest() == expected
+    ]
+
+
+def _find_marked_block(existing: str, file_path: Path) -> tuple[int, int] | None:
+    """The one span Headroom provably wrote, or ``None``.
+
+    ``None`` means "do not splice": either nothing here is ours (append), or more
+    than one span matches the recorded digest, which is genuinely ambiguous.
+    """
+    owned = _owned_marked_block_spans(existing, file_path)
+    return owned[0] if len(owned) == 1 else None
+
+
+def _marked_block_is_ambiguous(existing: str, file_path: Path) -> bool:
+    """True when several spans match the recorded digest (identical duplicates)."""
+    return len(_owned_marked_block_spans(existing, file_path)) > 1
+
+
+def _read_instruction_file(file_path: Path) -> str | None:
+    """Raw text of an instruction file, or ``None`` when it is not safe to rewrite.
+
+    Fails closed on invalid UTF-8. Decoding with ``errors="replace"`` and then
+    writing the result back would substitute U+FFFD for every undecodable byte
+    across the *whole* file -- silent corruption of content this function only
+    means to read.
+
+    A NUL byte also fails closed. UTF-16LE-encoded ASCII is *valid* UTF-8 (the
+    interleaved NULs decode as U+0000), so the decode guard alone admits such a
+    file and the rewrite leaves it undecodable in its own encoding. Real markdown
+    never contains NUL -- git itself treats a NUL-bearing file as binary -- so
+    rejecting it costs nothing and also covers UTF-16BE and UTF-32.
+    """
+    try:
+        text = file_path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    return None if "\x00" in text else text
+
+
+def _write_preserving_line_endings(file_path: Path, original: str, updated: str) -> None:
+    """Write ``updated``, keeping the file's existing dominant line ending.
+
+    ``_read_text`` normalizes CRLF to LF and ``_write_text`` writes newlines
+    verbatim, which is harmless for the JSON configs that helper was built for
+    but not for a *source-controlled* file: rewriting one marked region would
+    convert every line ending in the file and show up as a whole-file diff on a
+    CRLF checkout. Restore whatever the file already used.
+    """
+    if "\r\n" in original:
+        updated = updated.replace("\r\n", "\n").replace("\n", "\r\n")
+    _write_text(file_path, updated)
+
+
+def _inject_copilot_models_instructions(
+    file_path: Path, model_ids: list[str], verbose: bool = False
+) -> bool:
+    """Write/refresh the available-models block in Copilot's instruction file.
+
+    Rewrites in place when a well-formed marker pair is present, so the list
+    follows the live catalog instead of going stale on the first launch that
+    wrote it. Only the marked region is touched; everything the user wrote is
+    preserved, including their line endings.
+    """
+    if not model_ids:
+        return False
+    block = _copilot_models_instructions_block(model_ids)
+    if file_path.exists():
+        raw = _read_instruction_file(file_path)
+        if raw is None:
+            click.echo(
+                f"  Note: {file_path} is not valid UTF-8; leaving it untouched rather "
+                "than risk rewriting it. Run `headroom models` to see available models."
+            )
+            return False
+        existing = raw.replace("\r\n", "\n")
+        if _marked_block_is_ambiguous(existing, file_path):
+            click.echo(
+                f"  Warning: {file_path} contains more than one copy of the Headroom "
+                "available-models block, so which to update is ambiguous. Leaving the "
+                "file untouched — delete the duplicate block, or pass --no-model-list "
+                "to stop managing it."
+            )
+            return False
+        span = _find_marked_block(existing, file_path)
+        if span is not None:
+            start, end = span
+            new_block = block.rstrip("\n")
+            updated = existing[:start] + new_block + existing[end:]
+            if updated == existing:
+                if verbose:
+                    click.echo(f"  Available-models list already current in {file_path.name}")
+                return True
+            _write_preserving_line_endings(file_path, raw, updated)
+            _record_copilot_models_provenance(file_path, new_block)
+            click.echo(
+                f"  Refreshed available-models list in {file_path} ({len(model_ids)} models)"
+            )
+            return True
+        # Not provably ours: append rather than splice. A visible duplicate is
+        # recoverable; cutting a span out of the user's file is not.
+        appended = block.rstrip("\n")
+        _write_preserving_line_endings(
+            file_path, raw, existing.rstrip("\n") + "\n\n" + appended + "\n"
+        )
+        _record_copilot_models_provenance(file_path, appended)
+    else:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_text(file_path, block)
+        _record_copilot_models_provenance(file_path, block.rstrip("\n"))
+    click.echo(f"  Available-models list injected into {file_path} ({len(model_ids)} models)")
+    return True
+
+
+def _remove_copilot_models_instructions(file_path: Path) -> bool:
+    """Strip **our** generated block, leaving everything the user wrote intact.
+
+    Removes a block only when ownership is unambiguous, on the same rules as the
+    injector. A user's own quoted marker pair -- even a complete one -- is never
+    deleted, and an ambiguous file is left alone.
+    """
+    if not file_path.exists():
+        return False
+    raw = _read_instruction_file(file_path)
+    if raw is None:
+        click.echo(
+            f"  Note: {file_path} could not be read as UTF-8; leaving it untouched. "
+            "Remove the Headroom available-models block by hand if you want it gone."
+        )
+        return False
+    existing = raw.replace("\r\n", "\n")
+    # Removal can act on every proven copy: each one is byte-identical to what we
+    # wrote, so deleting all of them cannot touch user text -- and leaving a
+    # duplicate behind would mean `unwrap` cannot undo its own durable setup.
+    owned = _owned_marked_block_spans(existing, file_path)
+    if not owned:
+        return False
+    updated = existing
+    for start, end in reversed(owned):
+        updated = updated[:start].rstrip("\n") + "\n\n" + updated[end:].lstrip("\n")
+    _write_preserving_line_endings(file_path, raw, updated.rstrip("\n") + "\n")
+    _clear_copilot_models_provenance(file_path)
+    return True
+
+
 def _serena_project_skip_reason(root: Path) -> str | None:
     """Why Serena's per-project setup must not run for *root* (None = proceed).
 
@@ -2563,6 +2916,56 @@ def _apply_project_header_env(env: dict[str, str]) -> None:
         env["ANTHROPIC_CUSTOM_HEADERS"] = header_line
 
 
+#: Anthropic's real API host — what Claude Code's traffic must reach.
+_ANTHROPIC_DEFAULT_UPSTREAM = "https://api.anthropic.com"
+#: Per-request upstream override honoured by the proxy's ``/v1/messages`` route.
+_ANTHROPIC_UPSTREAM_PIN_HEADER = "X-Headroom-Base-Url"
+
+
+def _apply_anthropic_upstream_pin_env(env: dict[str, str], *, port: int) -> str | None:
+    """Let Claude Code share a proxy whose Anthropic upstream points elsewhere.
+
+    A proxy has exactly one destination for ``/v1/messages``. ``wrap copilot
+    --native`` pins that at the Copilot host so the CLI can drive Claude models,
+    which is also what makes that proxy unsafe for Claude Code by default: the
+    Anthropic handler forwards the client's own ``x-api-key`` unchanged, so
+    sharing would hand the user's Anthropic key to GitHub (reproduced: Copilot
+    answers ``missing required Authorization header``).
+
+    Claude Code attaches custom headers to every API request, and the proxy's
+    ``/v1/messages`` route honours a per-request upstream override. Setting it
+    routes this client's traffic to Anthropic regardless of where the shared
+    proxy points (reproduced: the same request then reaches Anthropic and is
+    answered by Anthropic's own error shape). That is what makes one proxy for
+    the Copilot CLI, VS Code *and* Claude Code safe rather than merely possible.
+
+    No-ops when the proxy is absent or already Anthropic-pinned, so the ordinary
+    single-client setup is untouched. A user-supplied override always wins.
+    Returns the pinned upstream when one was written, for the caller to report.
+    """
+    try:
+        helpers = _live_wrap_module()
+        running = helpers._proxy_health_config(helpers._query_proxy_health(port))
+    except Exception:  # noqa: BLE001 — never block a launch on this probe
+        return None
+    if not running:
+        return None
+    current = _normalize_proxy_api_url(running.get("anthropic_api_url"))
+    if current is None or current == _normalize_proxy_api_url(_ANTHROPIC_DEFAULT_UPSTREAM):
+        return None
+
+    header_line = f"{_ANTHROPIC_UPSTREAM_PIN_HEADER}: {_ANTHROPIC_DEFAULT_UPSTREAM}"
+    existing = env.get("ANTHROPIC_CUSTOM_HEADERS")
+    if existing:
+        for line in existing.splitlines():
+            if line.split(":", 1)[0].strip().lower() == _ANTHROPIC_UPSTREAM_PIN_HEADER.lower():
+                return None  # user override wins
+        env["ANTHROPIC_CUSTOM_HEADERS"] = f"{existing}\n{header_line}"
+    else:
+        env["ANTHROPIC_CUSTOM_HEADERS"] = header_line
+    return _ANTHROPIC_DEFAULT_UPSTREAM
+
+
 # Codex's own built-in providers plus Headroom's injected one — never treated
 # as a "custom upstream to preserve" by _detect_custom_codex_upstream_base_url.
 _CODEX_BUILTIN_PROVIDER_NAMES = frozenset({"openai", "anthropic", "azure", "headroom"})
@@ -3207,6 +3610,54 @@ def _proxy_active_session_count(payload: dict[str, Any] | None) -> int:
     return max(counts, default=0)
 
 
+def _proxy_anthropic_upstream_mismatch(
+    running_config: dict[str, object], requested: str | None
+) -> bool:
+    """True when a running proxy's Anthropic upstream differs from what we want.
+
+    ``anthropic_api_url`` defaults to ``None`` on the proxy, so "not reported"
+    means "using the default upstream" -- which is why a plain ``wrap claude``
+    reusing a plain proxy still matches and is not needlessly restarted.
+    """
+    running = _normalize_proxy_api_url(running_config.get("anthropic_api_url"))
+    if running is None:
+        return False
+    return running != _normalize_proxy_api_url(requested) if requested else True
+
+
+def _proxy_serves_same_copilot_seed(
+    running_config: dict[str, object] | None, requested_oauth_token: str | None
+) -> bool:
+    """True only when a running proxy is provably seeded with *this* credential.
+
+    Copilot seeds are per-session, so historically any running proxy forced a
+    wrap session onto a dedicated port. That is the right default when the
+    credentials differ -- sharing would send one account's traffic upstream
+    under another's token -- but it also split the two surfaces of a *single*
+    account: `wrap copilot --native` and `wrap vscode-chat` are the same user,
+    the same token and the same upstream, yet ended up on two proxies, two
+    dashboards and two halves of the savings.
+
+    Identity is the long-lived OAuth token, digested. The Copilot *API* token is
+    re-minted by every exchange, so comparing that would report "different user"
+    for two sessions of the same account and never share anything. No token is
+    exchanged to make the decision -- only the same non-secret digest
+    ``headroom copilot-auth`` already prints.
+
+    Fails closed: an absent or unreadable fingerprint (older proxy, no seed,
+    OAuth token not available) is "unknown", which keeps the isolating behaviour
+    rather than guessing that sharing is safe.
+    """
+    if not requested_oauth_token or not running_config:
+        return False
+    running = running_config.get("copilot_token_fingerprint")
+    if not isinstance(running, str) or not running:
+        return False
+    from headroom.copilot_auth import token_fingerprint
+
+    return running == token_fingerprint(requested_oauth_token)
+
+
 def _normalize_proxy_api_url(url: object) -> str | None:
     """Normalize configured upstream URLs for running-proxy comparisons."""
     if not isinstance(url, str):
@@ -3573,6 +4024,31 @@ def _copilot_default_wire_api_for_model(model: str | None) -> str:
     return _copilot_default_wire_api_for_model_impl(model)
 
 
+def _build_copilot_native_launch_env(
+    *, port: int, environ: dict[str, str], project: str | None
+) -> tuple[dict[str, str], list[str]]:
+    """Launch env for native (non-BYOK) Copilot routing through the proxy."""
+    from headroom.providers.copilot.wrap import build_native_launch_env
+
+    return build_native_launch_env(port=port, environ=environ, project=project)
+
+
+def _native_api_url_supported(*, environ: Mapping[str, str] | None = None) -> bool | None:
+    """Whether the installed Copilot CLI honours ``COPILOT_API_URL`` (None=unknown)."""
+    from headroom.providers.copilot.wrap import native_api_url_supported
+
+    return native_api_url_supported(environ=environ)
+
+
+def _resolve_copilot_wire_api_for_model(
+    model: str | None, *, api_url: str | None, token: str | None
+) -> str:
+    """Wire API for ``model``, from its published endpoints when discoverable."""
+    from headroom.providers.copilot.wrap import resolve_wire_api_for_model
+
+    return resolve_wire_api_for_model(model, api_url=api_url, token=token)
+
+
 def _should_use_copilot_oauth(
     *,
     backend: str | None,
@@ -3677,6 +4153,18 @@ def _ensure_proxy_unlocked(
         isolated_copilot_subscription_proxy = copilot_subscription_seed_requested and (
             manifest is not None or helpers._check_proxy(port)
         )
+        # ...unless the proxy already there is serving this very credential, in
+        # which case it is this user's own session on another surface (Copilot
+        # CLI alongside VS Code) and sharing is both safe and wanted: one proxy,
+        # one dashboard, one savings total.
+        shared_copilot_seed = False
+        if isolated_copilot_subscription_proxy:
+            shared_copilot_seed = _proxy_serves_same_copilot_seed(
+                helpers._proxy_health_config(helpers._query_proxy_health(port)),
+                copilot_refresh_oauth_token,
+            )
+            if shared_copilot_seed:
+                isolated_copilot_subscription_proxy = False
         if isolated_copilot_subscription_proxy:
             click.echo(
                 "  Copilot subscription seeds are session-specific; "
@@ -3727,7 +4215,11 @@ def _ensure_proxy_unlocked(
                         missing.append("learn")
                     if code_graph and not running_config.get("code_graph"):
                         missing.append("code_graph")
-                    if copilot_subscription_seed_requested:
+                    # Not "missing" when the proxy already carries this exact
+                    # credential: it is this user's own session on another
+                    # surface, and re-seeding would restart a proxy that is
+                    # already correct.
+                    if copilot_subscription_seed_requested and not shared_copilot_seed:
                         missing.append("copilot-subscription-auth")
                     if openai_api_url:
                         running_openai_url = _normalize_proxy_api_url(
@@ -3736,6 +4228,14 @@ def _ensure_proxy_unlocked(
                         requested_openai_url = _normalize_proxy_api_url(openai_api_url)
                         if running_openai_url != requested_openai_url:
                             missing.append("openai-api-url")
+                    # Compared even when the caller wants the DEFAULT upstream
+                    # (anthropic_api_url is None), unlike the openai check above.
+                    # `wrap copilot --native` points the Anthropic upstream at the
+                    # Copilot host, so reusing that proxy for `wrap claude` would
+                    # silently send Claude Code's /v1/messages traffic to Copilot
+                    # with the wrong credential. A mismatch must force a restart.
+                    if _proxy_anthropic_upstream_mismatch(running_config, anthropic_api_url):
+                        missing.append("anthropic-api-url")
                     if not missing:
                         click.echo(f"  Proxy already running on port {port}")
                         click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
@@ -3791,7 +4291,11 @@ def _ensure_proxy_unlocked(
                         missing.append("learn")
                     if code_graph and not running_config.get("code_graph"):
                         missing.append("code-graph")
-                    if copilot_subscription_seed_requested:
+                    # Not "missing" when the proxy already carries this exact
+                    # credential: it is this user's own session on another
+                    # surface, and re-seeding would restart a proxy that is
+                    # already correct.
+                    if copilot_subscription_seed_requested and not shared_copilot_seed:
                         missing.append("copilot-subscription-auth")
                     if openai_api_url:
                         running_openai_url = _normalize_proxy_api_url(
@@ -3880,7 +4384,7 @@ def _ensure_proxy_unlocked(
                     missing.append("learn")
                 if code_graph and not running_config.get("code_graph"):
                     missing.append("code_graph")
-                if copilot_subscription_seed_requested:
+                if copilot_subscription_seed_requested and not shared_copilot_seed:
                     missing.append("copilot-subscription-auth")
                 expected_savings_profile = helpers._wrap_agent_savings_profile(agent_type)
                 if (
@@ -3888,13 +4392,24 @@ def _ensure_proxy_unlocked(
                     and running_config.get("savings_profile") != expected_savings_profile
                 ):
                     missing.append("savings-profile")
-                if openai_api_url:
-                    running_openai_url = _normalize_proxy_api_url(
-                        running_config.get("openai_api_url")
-                    )
-                    requested_openai_url = _normalize_proxy_api_url(openai_api_url)
-                    if running_openai_url != requested_openai_url:
-                        missing.append("openai-api-url")
+                # Compared even when the caller wants the DEFAULT upstream
+                # (``*_api_url is None``). The old ``if openai_api_url:`` guard
+                # only fired when the caller pinned one, so a caller wanting the
+                # default never noticed a proxy pinned elsewhere -- and after
+                # `wrap copilot --native` (which points BOTH upstreams at the
+                # Copilot host) a later `wrap claude` silently reused it, sending
+                # Claude traffic to Copilot with the user's Anthropic credential
+                # replaced by the Copilot token. Landing this in ``missing``
+                # reuses the established kill-and-restart-on-the-same-port
+                # contract rather than inventing a second isolation mechanism.
+                for _label, _key, _requested in (
+                    ("openai-api-url", "openai_api_url", openai_api_url),
+                    ("anthropic-api-url", "anthropic_api_url", anthropic_api_url),
+                ):
+                    if _normalize_proxy_api_url(
+                        running_config.get(_key)
+                    ) != _normalize_proxy_api_url(_requested):
+                        missing.append(_label)
                 if vertex_api_url or clear_vertex_api_url:
                     running_vertex_url = _normalize_proxy_api_url(
                         running_config.get("vertex_api_url")
@@ -3907,11 +4422,30 @@ def _ensure_proxy_unlocked(
                     flags_str = ", ".join(
                         f if f.startswith("--") else f"--{f.replace('_', '-')}" for f in missing
                     )
+                    # An upstream mismatch is NOT a missing feature: sharing that
+                    # proxy would send this session's traffic to a different
+                    # vendor. After `wrap copilot --native` (both upstreams pinned
+                    # at the Copilot host) a `wrap claude` reusing it has its
+                    # Anthropic credential stripped and the Copilot token
+                    # substituted, silently. So it can neither be reused as-is nor
+                    # be fixed by restarting a proxy other sessions are using:
+                    # this session takes its own proxy instead.
+                    upstream_conflict = [flag for flag in missing if flag.endswith("-api-url")]
                     other_wrappers = helpers._live_proxy_clients(port, exclude_self=True)
-                    if other_wrappers:
-                        # Another wrapper is attached to this proxy; restarting it
-                        # to add flags would drop their in-flight requests. Reuse
-                        # the running proxy as-is rather than disrupt them.
+                    if upstream_conflict and other_wrappers:
+                        click.echo(
+                            f"  Proxy on port {port} is pinned to a different upstream "
+                            f"({', '.join(upstream_conflict)}) and {len(other_wrappers)} "
+                            "other wrapper(s) are attached."
+                        )
+                        click.echo(
+                            "  Starting a dedicated proxy for this session rather than "
+                            "sharing it or disrupting them."
+                        )
+                        isolated_copilot_subscription_proxy = True
+                    elif other_wrappers:
+                        # A genuinely missing *feature* is safe to live without;
+                        # restarting would drop other sessions' in-flight requests.
                         click.echo(
                             f"  Proxy on port {port} is missing: {flags_str}, but "
                             f"{len(other_wrappers)} other wrapper(s) are attached."
@@ -3948,7 +4482,10 @@ def _ensure_proxy_unlocked(
                             )
                             return None, port
 
-            if not needs_restart:
+            # `isolated_...` is also set when an upstream conflict was detected
+            # above, and it must veto reuse: returning here would hand this
+            # session a proxy pinned to another vendor's host.
+            if not needs_restart and not isolated_copilot_subscription_proxy:
                 click.echo(f"  Proxy already running on port {port}")
                 click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
                 return None, port
@@ -4293,6 +4830,7 @@ def _launch_tool(
     anyllm_provider: str | None = None,
     region: str | None = None,
     openai_api_url: str | None = None,
+    anthropic_api_url: str | None = None,
     copilot_api_token: str | None = None,
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
@@ -4329,6 +4867,7 @@ def _launch_tool(
             anyllm_provider=anyllm_provider,
             region=region,
             openai_api_url=openai_api_url,
+            anthropic_api_url=anthropic_api_url,
             copilot_api_token=copilot_api_token,
             copilot_refresh_oauth_token=copilot_refresh_oauth_token,
             copilot_api_token_expires_at=copilot_api_token_expires_at,
@@ -4339,10 +4878,19 @@ def _launch_tool(
         port_holder[0] = actual_port
         _push_runtime_env(actual_port, no_proxy)
 
-        # If port fell back, update env URLs to point at the actual port
+        # If port fell back, update env URLs to point at the actual port.
+        # The displayed lines must be rewritten too: they are built before the
+        # port is known, so leaving them stale makes the banner contradict
+        # itself ("Proxy ready on ...:8851" next to
+        # "COPILOT_PROVIDER_BASE_URL=...:8850"). The env was already correct, but
+        # a banner that misreports the port reads as a routing failure and sends
+        # people debugging a bug that isn't there.
         if actual_port != port:
+            _stale = f"127.0.0.1:{port}"
+            _fresh = f"127.0.0.1:{actual_port}"
             for k, v in dict(env).items():
-                env[k] = v.replace(f"127.0.0.1:{port}", f"127.0.0.1:{actual_port}")
+                env[k] = v.replace(_stale, _fresh)
+            env_vars_display = [line.replace(_stale, _fresh) for line in env_vars_display]
 
         if configure_launch is not None:
             args, env, env_vars_display = configure_launch(actual_port, args, env, env_vars_display)
@@ -4997,6 +5545,15 @@ def claude(
         # directory's name via X-Headroom-Project (user override wins).
         _apply_project_header_env(env)
 
+        # Sharing a Copilot-pinned proxy (the CLI + VS Code central proxy) is
+        # only safe once this client's own upstream is pinned per request.
+        _pinned_upstream = _apply_anthropic_upstream_pin_env(env, port=port)
+        if _pinned_upstream:
+            click.echo(
+                f"  Sharing a proxy pinned elsewhere; this session's Anthropic "
+                f"traffic is pinned to {_pinned_upstream}"
+            )
+
         # Issue #746: keep Claude Code's on-demand tool loading on through the
         # proxy so tool schemas are not eagerly materialized into local context.
         _tool_search_value = _configure_tool_search_env(env, tool_search)
@@ -5250,6 +5807,24 @@ def _require_copilot_subscription_resolution() -> CopilotSubscriptionTokenResolu
     ),
 )
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--native",
+    is_flag=True,
+    help=(
+        "Experimental: route Copilot's own GitHub-authenticated API through Headroom "
+        "instead of using the BYOK provider override. Keeps Copilot's native model "
+        "routing, so the /model picker stays populated and the MAIN agent's model can "
+        "be switched in-session. Implies --subscription; no --model required."
+    ),
+)
+@click.option(
+    "--no-model-list",
+    is_flag=True,
+    help=(
+        "Skip writing the available-models list into .github/copilot-instructions.md "
+        "(the list is what stops agents inventing unavailable model names under BYOK)"
+    ),
+)
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.argument("copilot_args", nargs=-1, type=click.UNPROCESSED)
 def copilot(
@@ -5262,6 +5837,8 @@ def copilot(
     wire_api: str | None,
     subscription: bool,
     memory: bool,
+    native: bool,
+    no_model_list: bool,
     verbose: bool,
     copilot_args: tuple[str, ...],
 ) -> None:
@@ -5306,6 +5883,36 @@ def copilot(
             )
         effective_backend = running_backend or effective_backend
 
+    # --native replaces the BYOK interposition rather than layering on it, so it
+    # implies subscription-style resolution (Copilot's hosted API, the user's own
+    # GitHub auth) and is incompatible with a BYOK provider type or a translated
+    # backend. Validated up front so a bad combination fails clearly instead of
+    # producing a session that silently bypasses Headroom.
+    if native:
+        subscription = True
+        if provider_type == "anthropic":
+            raise click.ClickException(
+                "--native routes Copilot's own API through Headroom and does not use the "
+                "BYOK provider override; do not combine it with --provider-type anthropic."
+            )
+        if wire_api is not None:
+            raise click.ClickException(
+                "--wire-api pins one BYOK wire API for the whole session, which is exactly "
+                "what --native avoids: the wire is chosen per request from the model. "
+                "Drop --wire-api."
+            )
+        if no_proxy:
+            # Native mode needs BOTH proxy upstreams pointed at the Copilot host,
+            # and those are start-time parameters -- there is no runtime path to
+            # repoint a proxy that is already running. With --no-proxy the
+            # overrides are silently discarded and every request 401s against the
+            # wrong vendor, so fail loudly instead.
+            raise click.ClickException(
+                "--native cannot be combined with --no-proxy: it needs to start a proxy "
+                "whose Anthropic and OpenAI upstreams both point at the Copilot host, and "
+                "an already-running proxy cannot be repointed at runtime."
+            )
+
     effective_provider_type = _resolve_copilot_provider_type(effective_backend, provider_type)
     if subscription:
         if effective_backend not in (None, "", "anthropic"):
@@ -5333,6 +5940,10 @@ def copilot(
     copilot_api_token_expires_at: float | None = None
     client_bearer: str | None = None
     subscription_resolution: CopilotSubscriptionTokenResolution | None = None
+    # Only set in --native mode: the native CLI sends Claude traffic on the
+    # Anthropic wire, so the proxy's Anthropic upstream must point at the Copilot
+    # host too. Left None for BYOK so that path is byte-identical to before.
+    copilot_native_anthropic_url: str | None = None
     if _should_use_copilot_oauth(
         backend=effective_backend,
         provider_type=provider_type,
@@ -5351,74 +5962,172 @@ def copilot(
                 "GITHUB_COPILOT_TOKEN / GITHUB_COPILOT_GITHUB_TOKEN."
             )
 
-        selected_model = _copilot_model_from_args(copilot_args, env)
-
-        # ``--model auto`` is a Copilot-internal routing token that the BYOK
-        # API rejects with ``400 The requested model is not supported``.  In
-        # subscription/OAuth mode we route to the real Copilot hosted API, so
-        # Copilot's own native auto-selection works fine — we just need to
-        # strip the ``--model auto`` flag before launch so Copilot doesn't
-        # forward it to the provider endpoint.
-        if _is_auto_model(selected_model):
-            copilot_args = _strip_auto_model_args(copilot_args)
-            selected_model = None
-            click.echo(
-                "  Note: '--model auto' is not forwarded to the Copilot API "
-                "(it would cause a 400). Removed it; Copilot will use its own "
-                "automatic model selection."
+        if native:
+            openai_api_url = (
+                subscription_resolution.api_url
+                if subscription_resolution is not None
+                else resolve_copilot_api_url(client_bearer)
             )
+            env, env_vars_display = _build_copilot_native_launch_env(
+                port=port,
+                environ=env,
+                project=_project_name_from_cwd(),
+            )
+            # The native CLI drives BOTH wires off this one base URL: Claude models
+            # over /v1/messages (the Anthropic shape) and OpenAI models over
+            # /responses or /chat/completions. So both of the proxy's upstreams have
+            # to resolve to the Copilot host, or /v1/messages lands on
+            # api.anthropic.com and returns 401.
+            env["GITHUB_COPILOT_API_URL"] = openai_api_url
+            env["OPENAI_TARGET_API_URL"] = openai_api_url
+            env["ANTHROPIC_TARGET_API_URL"] = openai_api_url
+            copilot_native_anthropic_url = openai_api_url
+            copilot_proxy_token = client_bearer
+            if subscription_resolution is not None:
+                copilot_refresh_oauth_token = subscription_resolution.refresh_oauth_token
+                copilot_api_token_expires_at = subscription_resolution.api_token_expires_at
+            env_vars_display.append(f"COPILOT_UPSTREAM={openai_api_url}")
 
-        env_wire_api = env.get("COPILOT_PROVIDER_WIRE_API")
-        effective_wire_api = wire_api or (
-            env_wire_api
-            if env_wire_api in {"completions", "responses"}
-            else _copilot_default_wire_api_for_model(selected_model)
-        )
-        env["COPILOT_PROVIDER_TYPE"] = "openai"
-        # Per-project savings: the Copilot CLI cannot send custom headers, so
-        # the project rides as a /p/<name> base-URL prefix the proxy strips.
-        env["COPILOT_PROVIDER_BASE_URL"] = _with_project_prefix(
-            f"http://127.0.0.1:{port}/v1", _project_name_from_cwd()
-        )
-        env["COPILOT_PROVIDER_WIRE_API"] = effective_wire_api
-        env["COPILOT_PROVIDER_BEARER_TOKEN"] = client_bearer
-        env["GITHUB_COPILOT_USE_TOKEN_EXCHANGE"] = "false"
-        env.pop("COPILOT_PROVIDER_API_KEY", None)
-        # Hand the exact token we resolved (and, for --subscription, validated
-        # against GitHub) to the proxy explicitly via copilot_proxy_token below.
-        # The proxy pins it as GITHUB_COPILOT_API_TOKEN, so upstream auth is
-        # deterministic instead of the proxy re-running unvalidated discovery
-        # (read_cached_oauth_token returns the *first* candidate, which may not
-        # be the one the wrapper approved → environment-dependent 401s). Passing
-        # it as a launch argument — rather than mutating this process's global
-        # os.environ — keeps the token off shared state and out of unrelated
-        # code paths.
-        copilot_proxy_token = client_bearer
-        if subscription_resolution is not None:
-            copilot_refresh_oauth_token = subscription_resolution.refresh_oauth_token
-            copilot_api_token_expires_at = subscription_resolution.api_token_expires_at
-        env_vars_display = [
-            "COPILOT_PROVIDER_TYPE=openai",
-            f"COPILOT_PROVIDER_BASE_URL={env['COPILOT_PROVIDER_BASE_URL']}",
-            f"COPILOT_PROVIDER_WIRE_API={effective_wire_api}",
-            (
-                "COPILOT_AUTH_MODE=github-subscription-experimental"
-                if subscription
-                else "COPILOT_AUTH_MODE=github-oauth"
-            ),
-        ]
-        # Non-subscription OAuth keeps upstream's generic-host policy from
-        # #610. Subscription mode can use the endpoint returned by the Copilot
-        # token exchange, which is how Business accounts advertise their API
-        # host without requiring users to configure it manually.
-        openai_api_url = (
-            subscription_resolution.api_url
-            if subscription_resolution is not None
-            else resolve_copilot_api_url(client_bearer)
-        )
-        env["GITHUB_COPILOT_API_URL"] = openai_api_url
-        env["OPENAI_TARGET_API_URL"] = openai_api_url
-        env_vars_display.append(f"COPILOT_PROVIDER_API_URL={openai_api_url}")
+            # Warn rather than refuse. The probe inspects the shipped bundle for an
+            # undocumented variable, so a false negative is possible (a needle
+            # split across a read boundary did exactly that) -- and refusing to
+            # launch a CLI that actually works is a worse outcome than proceeding
+            # with a clear warning. The genuine risk it guards is silent: if the
+            # variable really is gone, the CLI talks straight to GitHub and
+            # Headroom simply never sees the traffic, so the warning says how to
+            # confirm.
+            support = _native_api_url_supported(environ=os.environ)
+            if support is False:
+                click.echo(
+                    "  Warning: this Copilot CLI build does not appear to honour "
+                    "COPILOT_API_URL. If that is right, the CLI will bypass Headroom "
+                    "entirely and you will silently get no compression. Check the "
+                    f"dashboard at http://127.0.0.1:{port}/dashboard shows traffic; if "
+                    "it does not, re-run without --native to use BYOK mode."
+                )
+            elif support is None and verbose:
+                click.echo(
+                    "  Note: could not verify COPILOT_API_URL support in the installed CLI "
+                    "(it is undocumented). Proceeding; check the dashboard shows traffic."
+                )
+            click.echo(
+                "  Native mode: Copilot keeps its own model routing, so /model switches "
+                "the main agent in-session and --model is optional."
+            )
+        else:
+            selected_model = _copilot_model_from_args(copilot_args, env)
+
+            # ``--model auto`` is a Copilot-internal routing token that the BYOK
+            # API rejects with ``400 The requested model is not supported``.  In
+            # subscription/OAuth mode we route to the real Copilot hosted API, so
+            # Copilot's own native auto-selection works fine — we just need to
+            # strip the ``--model auto`` flag before launch so Copilot doesn't
+            # forward it to the provider endpoint.
+            if _is_auto_model(selected_model):
+                copilot_args = _strip_auto_model_args(copilot_args)
+                selected_model = None
+                click.echo(
+                    "  Note: '--model auto' is not forwarded to the Copilot API "
+                    "(it would cause a 400). Removed it; Copilot will use its own "
+                    "automatic model selection."
+                )
+
+            # The wire API is pinned for the whole session, so guessing it from the
+            # model name can make a valid main model unusable: mai-code-1-flash-picker
+            # is /responses-only but does not match gpt-5*/o1*/o3*, so the heuristic
+            # pinned "completions" and every turn 400'd. Ask the upstream which
+            # endpoints actually serve this model; falls back to the heuristic on any
+            # failure, so launch never depends on discovery succeeding.
+            env_wire_api = env.get("COPILOT_PROVIDER_WIRE_API")
+            effective_wire_api = wire_api or (
+                env_wire_api
+                if env_wire_api in {"completions", "responses"}
+                else (
+                    _resolve_copilot_wire_api_for_model(
+                        selected_model,
+                        api_url=(
+                            subscription_resolution.api_url
+                            if subscription_resolution is not None
+                            else None
+                        ),
+                        token=client_bearer,
+                    )
+                    if subscription
+                    else _copilot_default_wire_api_for_model(selected_model)
+                )
+            )
+            env["COPILOT_PROVIDER_TYPE"] = "openai"
+            # Per-project savings: the Copilot CLI cannot send custom headers, so
+            # the project rides as a /p/<name> base-URL prefix the proxy strips.
+            env["COPILOT_PROVIDER_BASE_URL"] = _with_project_prefix(
+                f"http://127.0.0.1:{port}/v1", _project_name_from_cwd()
+            )
+            env["COPILOT_PROVIDER_WIRE_API"] = effective_wire_api
+            env["COPILOT_PROVIDER_BEARER_TOKEN"] = client_bearer
+            env["GITHUB_COPILOT_USE_TOKEN_EXCHANGE"] = "false"
+            env.pop("COPILOT_PROVIDER_API_KEY", None)
+            # Hand the exact token we resolved (and, for --subscription, validated
+            # against GitHub) to the proxy explicitly via copilot_proxy_token below.
+            # The proxy pins it as GITHUB_COPILOT_API_TOKEN, so upstream auth is
+            # deterministic instead of the proxy re-running unvalidated discovery
+            # (read_cached_oauth_token returns the *first* candidate, which may not
+            # be the one the wrapper approved → environment-dependent 401s). Passing
+            # it as a launch argument — rather than mutating this process's global
+            # os.environ — keeps the token off shared state and out of unrelated
+            # code paths.
+            copilot_proxy_token = client_bearer
+            if subscription_resolution is not None:
+                copilot_refresh_oauth_token = subscription_resolution.refresh_oauth_token
+                copilot_api_token_expires_at = subscription_resolution.api_token_expires_at
+            env_vars_display = [
+                "COPILOT_PROVIDER_TYPE=openai",
+                f"COPILOT_PROVIDER_BASE_URL={env['COPILOT_PROVIDER_BASE_URL']}",
+                f"COPILOT_PROVIDER_WIRE_API={effective_wire_api}",
+                (
+                    "COPILOT_AUTH_MODE=github-subscription-experimental"
+                    if subscription
+                    else "COPILOT_AUTH_MODE=github-oauth"
+                ),
+            ]
+            # Non-subscription OAuth keeps upstream's generic-host policy from
+            # #610. Subscription mode can use the endpoint returned by the Copilot
+            # token exchange, which is how Business accounts advertise their API
+            # host without requiring users to configure it manually.
+            openai_api_url = (
+                subscription_resolution.api_url
+                if subscription_resolution is not None
+                else resolve_copilot_api_url(client_bearer)
+            )
+            env["GITHUB_COPILOT_API_URL"] = openai_api_url
+            env["OPENAI_TARGET_API_URL"] = openai_api_url
+            env_vars_display.append(f"COPILOT_PROVIDER_API_URL={openai_api_url}")
+
+            # Restore model-choice parity with native Copilot. BYOK tells the CLI
+            # about exactly one model, so an agent asked to "use a different model"
+            # has nothing authoritative to consult and invents or scrapes names
+            # (observed live: claude-fable-5, claude-opus-4.8-fast, grok-4.5 —
+            # none of them Copilot models). Writing the real list into the
+            # instruction file gives it the same knowledge native Copilot has.
+            # Skipped with --no-model-list, and removed by `unwrap copilot`.
+            from headroom.models.copilot_catalog import catalog_enabled
+
+            if not no_model_list and catalog_enabled():
+                # Best-effort, never fatal. origin/main never wrote this file, so a
+                # crash here would be a pure regression: `.github` existing as a file
+                # raises FileExistsError from mkdir, and a read-only target raises
+                # PermissionError from the atomic os.replace. Model guidance is a
+                # convenience -- it must never stop a session from launching.
+                try:
+                    _inject_copilot_models_instructions(
+                        Path.cwd() / ".github" / "copilot-instructions.md",
+                        _live_copilot_model_ids(openai_api_url, client_bearer),
+                        verbose=verbose,
+                    )
+                except OSError as exc:
+                    click.echo(
+                        f"  Note: could not write the available-models list ({exc}). "
+                        "Continuing; run `headroom models` to see what is available."
+                    )
     else:
         env, env_vars_display = _build_copilot_launch_env(
             port=port,
@@ -5478,6 +6187,9 @@ def copilot(
         anyllm_provider=anyllm_provider,
         region=region,
         openai_api_url=openai_api_url,
+        # None outside --native, so the BYOK path keeps the proxy's default
+        # Anthropic upstream untouched.
+        anthropic_api_url=copilot_native_anthropic_url,
         copilot_api_token=copilot_proxy_token,
         copilot_refresh_oauth_token=copilot_refresh_oauth_token,
         copilot_api_token_expires_at=copilot_api_token_expires_at,
@@ -5566,6 +6278,303 @@ def unwrap_vscode_copilot(settings_file: Path | None) -> None:
         click.echo(f"Removed Headroom Copilot proxy settings from {target_settings}")
     else:
         click.echo(f"No Headroom Copilot proxy settings found in {target_settings}")
+
+
+# =============================================================================
+# GitHub Copilot Chat in VS Code (BYOK Custom Endpoint)
+# =============================================================================
+
+
+@wrap.command("vscode-chat")
+@click.option("--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--models-file",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help="Override chatLanguageModels.json path (Insiders, VSCodium, custom profiles)",
+)
+@click.option(
+    "--settings-file",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help="Override settings.json path",
+)
+@click.option(
+    "--configure/--no-configure",
+    default=True,
+    help="Write the routing settings into VS Code's settings.json",
+)
+@click.option(
+    "--byok-models/--no-byok-models",
+    default=False,
+    help="Also register duplicate '(Headroom)' models as a BYOK provider (rarely needed)",
+)
+def vscode_chat(
+    port: int,
+    memory: bool,
+    models_file: Path | None,
+    settings_file: Path | None,
+    configure: bool,
+    byok_models: bool,
+) -> None:
+    """Route GitHub Copilot **Chat** in VS Code through Headroom.
+
+    \b
+    Redirects the Chat extension's whole API surface at the local proxy, the way
+    `wrap copilot --native` does for the CLI. Copilot's own model picker is
+    unchanged and the models it offers are compressed -- including the models
+    the *agent* picks for itself, which is what subagents and auto model
+    selection do.
+
+    \b
+    Two paths still bypass it: the execution subagent when it uses the agentic
+    proxy (a different base URL, only on non-PowerShell terminals), and agent
+    host sessions, which run the Copilot CLI binary in a separate process.
+
+    \b
+    --byok-models additionally registers duplicate "(Headroom)" entries as a
+    Custom Endpoint provider. That was the original mechanism and is now
+    redundant: it only ever covered models a human picked by hand, so a subagent
+    kept running on Copilot's uncompressed endpoint. Off by default.
+
+    \b
+    Not covered: inline (ghost-text) completions, semantic search and embeddings
+    always go straight to GitHub, whatever model is selected. VS Code routes
+    those outside this path, so Headroom cannot see or compress them.
+    """
+    from headroom.providers.copilot.vscode_chat import (
+        BYOK_ENABLED_SETTING,
+        CAPI_OVERRIDE_SETTING,
+        build_model_entries,
+        build_provider_block,
+        byok_entitlement_enabled,
+        chat_models_path,
+        configure_chat_models,
+        enable_byok_setting,
+        enable_capi_override,
+        proxy_base_url,
+    )
+
+    resolution = _require_copilot_subscription_resolution()
+
+    # Only the BYOK path needs the entitlement, and it is opt-in now -- refusing
+    # to launch without it would block the CAPI route, which does not use BYOK
+    # at all.
+    if byok_models:
+        entitled = byok_entitlement_enabled(resolution.token)
+        if entitled is False:
+            raise click.ClickException(
+                "This GitHub Copilot seat does not permit bring-your-own-key models "
+                "(client_byok=0), so VS Code will not show a Custom Endpoint provider. "
+                "That is an organization policy; ask your Copilot admin to enable "
+                "'Bring Your Own Language Model Key in VS Code'. Re-run without "
+                "--byok-models to route through Copilot's own picker instead."
+            )
+        if entitled is None:
+            click.echo(
+                "  Note: could not confirm the BYOK entitlement on this token; continuing. "
+                "If no Headroom models appear in the picker, your org may have it disabled."
+            )
+
+    target_models = models_file or chat_models_path()
+    target_settings = settings_file or vscode_settings_path()
+
+    def _print_setup(actual_port: int) -> None:
+        base = proxy_base_url(actual_port, _project_name_from_cwd())
+        if not configure:
+            click.echo("  Add this to VS Code's USER settings.json:")
+            click.echo(f'    "{CAPI_OVERRIDE_SETTING}": "{base}"')
+            click.echo("  then restart VS Code.")
+            return
+
+        # The CAPI redirect is the whole feature: it points Copilot Chat's own
+        # API surface at the proxy, so every model in Copilot's normal picker is
+        # compressed -- including the ones the agent chooses for a subagent.
+        try:
+            capi_action = enable_capi_override(target_settings, base)
+        except click.ClickException as exc:
+            click.echo(f"  Warning: could not update {target_settings}: {exc.format_message()}")
+            click.echo(f'    Add "{CAPI_OVERRIDE_SETTING}": "{base}" by hand.')
+            return
+        if capi_action == "already set by user":
+            click.echo(
+                f"  Note: {CAPI_OVERRIDE_SETTING} already has your own value in "
+                f"{target_settings}; leaving it alone. Chat traffic will not reach "
+                "Headroom unless it points at this proxy."
+            )
+        elif capi_action == "not ours":
+            # Marker text is there but unproven, so nothing was written and the
+            # OLD value is still what VS Code will use. Saying "updated" here
+            # would send the user off to test a proxy they are not pointed at.
+            click.echo(
+                f"  Warning: {target_settings} contains Headroom routing markers that "
+                "Headroom cannot prove it wrote (an incomplete marker pair, or a block "
+                "edited since). Nothing was changed and the existing value is still live."
+            )
+            click.echo(
+                f"    Remove those lines by hand, or set "
+                f'"{CAPI_OVERRIDE_SETTING}": "{base}" yourself, then restart VS Code.'
+            )
+        else:
+            click.echo(f"  Copilot Chat routing {capi_action}: {target_settings}")
+            click.echo(f"    {CAPI_OVERRIDE_SETTING} -> {base}")
+            click.echo(
+                "  Restart VS Code, then use Copilot's normal model picker -- the "
+                "models it offers now flow through Headroom."
+            )
+            # Measured in the extension: on a dead base it pings, waits
+            # 1s/10s/10s and retries the same base -- there is no failover to
+            # api.githubcopilot.com. So a stopped proxy reads as VS Code hanging
+            # for ~20s a request, with nothing on screen naming the cause.
+            click.echo(
+                "  While this is set, Copilot Chat needs this proxy: stopping it "
+                "makes chat hang ~20s per request with no error naming Headroom. "
+                "Run `headroom unwrap vscode-chat` and restart VS Code to undo."
+            )
+        click.echo(
+            "  Inline completions are NOT routed through Headroom (VS Code sends "
+            "those to GitHub directly), so they are neither compressed nor counted."
+        )
+
+        if not byok_models:
+            return
+
+        entries = build_model_entries(
+            _live_copilot_models_payload(resolution.api_url, resolution.token), base
+        )
+        if not entries:
+            click.echo(
+                "  Note: could not read the model catalog, so no models were written. "
+                "Check `headroom models`, then re-run."
+            )
+            return
+        # Settings first, models second. Both writes can fail (unparseable file,
+        # read-only), and failing after the models are written would leave the
+        # picker advertising a Headroom provider that 1.132+ then hides anyway,
+        # because the visibility gate never got set. This ordering means a failure
+        # leaves nothing half-configured.
+        # Guarded for the same reason the models write below is: a hand-edited
+        # or unreadable settings.json must not take the proxy down with it.
+        # `enable_byok_setting` raises on JSONC this parser cannot validate, and
+        # `vscode_settings_path()` raises when APPDATA is unset -- neither is a
+        # reason to end a session that is otherwise working.
+        try:
+            setting_action = enable_byok_setting(target_settings)
+        except click.ClickException as exc:
+            click.echo(f"  Warning: could not update {target_settings}: {exc.format_message()}")
+            click.echo(
+                f"    Set {BYOK_ENABLED_SETTING} to true by hand, or VS Code 1.132+ "
+                "will hide every Headroom model."
+            )
+            return
+        if setting_action == "set to false by user":
+            click.echo(
+                f"  Warning: {BYOK_ENABLED_SETTING} is set to false in {target_settings}. "
+                "VS Code will hide every Headroom model until you set it to true."
+            )
+        elif setting_action == "not ours":
+            click.echo(
+                f"  Warning: {target_settings} contains Headroom BYOK markers that Headroom "
+                "cannot prove it wrote; nothing was changed. Remove those lines by hand, or "
+                f"set {BYOK_ENABLED_SETTING} to true yourself."
+            )
+        else:
+            click.echo(f"  {BYOK_ENABLED_SETTING} {setting_action}: {target_settings}")
+        # Config failure must not take the proxy down with it: the session is
+        # still usable via the CLI wrappers, and an existing config from a
+        # previous run may well still be valid.
+        try:
+            action = configure_chat_models(target_models, build_provider_block(entries))
+            click.echo(f"  VS Code chat models {action}: {target_models} ({len(entries)} models)")
+        except click.ClickException as exc:
+            click.echo(f"  Warning: could not update {target_models}: {exc.format_message()}")
+            click.echo("    The proxy is still running; fix the file and re-run to refresh.")
+            return
+        click.echo(
+            "  Pick a model named '… (Headroom)' in the chat model picker. "
+            "Restart VS Code if they do not appear yet."
+        )
+        click.echo(
+            "  Inline completions are NOT routed through Headroom (VS Code sends "
+            "those to GitHub directly), so they are neither compressed nor counted."
+        )
+
+    _run_proxy_only_watcher(
+        agent_label="VS CODE COPILOT CHAT",
+        port=port,
+        no_proxy=False,
+        learn=False,
+        memory=memory,
+        agent_type="copilot",
+        print_setup_lines=_print_setup,
+        openai_api_url=resolution.api_url,
+        # The Custom Endpoint provider can address Claude models, which ride the
+        # Anthropic wire; both upstreams must resolve to the Copilot host or that
+        # traffic would be forwarded to api.anthropic.com.
+        anthropic_api_url=resolution.api_url,
+        copilot_api_token=resolution.token,
+        copilot_refresh_oauth_token=resolution.refresh_oauth_token,
+        copilot_api_token_expires_at=resolution.api_token_expires_at,
+    )
+
+
+@unwrap.command("vscode-chat")
+@click.option(
+    "--models-file",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help="Override chatLanguageModels.json path",
+)
+@click.option(
+    "--settings-file",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help="Override settings.json path",
+)
+def unwrap_vscode_chat(models_file: Path | None, settings_file: Path | None) -> None:
+    """Restore VS Code Copilot Chat to talking to GitHub directly."""
+    from headroom.providers.copilot.vscode_chat import (
+        chat_models_path,
+        disable_byok_setting,
+        disable_capi_override,
+        remove_chat_models,
+    )
+
+    target_models = models_file or chat_models_path()
+    target_settings = settings_file or vscode_settings_path()
+    removed = False
+    refused = False
+    # Each step is attempted independently. Unwrap is the recovery path -- if one
+    # write cannot be made safely, the others must still run, or a single
+    # unparseable section would leave Copilot Chat pointed at a dead port with no
+    # way back except hand-editing the file.
+    for label, action in (
+        # Routing first: a proxy pointed at nothing breaks chat outright, whereas
+        # a leftover model entry merely looks untidy.
+        ("Copilot Chat routing restored to GitHub", lambda: disable_capi_override(target_settings)),
+        ("Headroom chat models removed", lambda: remove_chat_models(target_models)),
+        ("BYOK setting block removed", lambda: disable_byok_setting(target_settings)),
+    ):
+        try:
+            if action():
+                click.echo(f"{label}.")
+                removed = True
+        except (OSError, click.ClickException) as exc:
+            message = exc.format_message() if isinstance(exc, click.ClickException) else str(exc)
+            click.echo(f"Could not complete '{label.lower()}': {message}")
+            refused = True
+    if removed:
+        click.echo("Restart VS Code for it to take effect.")
+    elif refused:
+        # Never say "not routed" after refusing to touch something: whatever is
+        # in the file is still live, and that is the opposite of reassuring.
+        click.echo(
+            "Nothing was changed. VS Code may still be routed through Headroom -- "
+            "check the settings named above by hand."
+        )
+    else:
+        click.echo("Nothing to remove; VS Code was not routed through Headroom.")
 
 
 # =============================================================================
@@ -5660,6 +6669,16 @@ def unwrap_vscode_claude(settings_file: Path | None) -> None:
 @click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
 def unwrap_copilot(port: int, no_stop_proxy: bool) -> None:
     """Undo durable setup from ``headroom wrap copilot``."""
+    instructions = Path.cwd() / ".github" / "copilot-instructions.md"
+    # Guarded: the write can raise (read-only file, replaced path) and an uncaught
+    # error here would abort `unwrap` before it stops the proxy — leaving the
+    # session's proxy running, which is the opposite of undoing the setup.
+    try:
+        if _remove_copilot_models_instructions(instructions):
+            click.echo("  Removed Headroom available-models list from Copilot instructions.")
+    except OSError as exc:
+        click.echo(f"  Note: could not update {instructions} ({exc}); continuing.")
+
     if not no_stop_proxy:
         _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
 

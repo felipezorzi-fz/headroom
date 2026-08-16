@@ -42,6 +42,8 @@ if TYPE_CHECKING:
     from fastapi import Request, WebSocket
     from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+    from headroom.proxy.body_forwarding import BodyMutationTracker
+
 import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
@@ -64,7 +66,7 @@ from headroom.providers.codex.runtime import (
 from headroom.providers.codex.runtime import (
     resolve_codex_routing_headers as _resolve_codex_routing_headers,
 )
-from headroom.providers.copilot import model_prefers_responses_api
+from headroom.providers.copilot import VSCODE_MODEL_ID_PREFIX, model_prefers_responses_api
 from headroom.proxy.auth_mode import (
     classify_auth_mode,
     classify_client,
@@ -176,6 +178,149 @@ _OPENAI_RESPONSES_PATH = "/responses"
 _OPENAI_ORIGINAL_PATH_HEADER = "x-headroom-original-path"
 _OPENAI_BASE_URL_HEADER = "x-headroom-base-url"
 _decode_openai_bearer_payload = decode_openai_bearer_payload
+
+#: Known GitHub Copilot model IDs, used only as a best-effort target set for
+#: `normalize_copilot_model_id()`. Not a source of truth for what a given
+#: account/integration can actually access (that varies by entitlement, see
+#: `model_not_available_for_integrator` upstream errors) -- just the set of
+#: canonical spellings a casually-typed model name might be corrected to.
+_KNOWN_COPILOT_MODEL_IDS: frozenset[str] = frozenset(
+    {
+        "gpt-4.1",
+        "gpt-4.1-2025-04-14",
+        "gpt-4",
+        "gpt-4-0613",
+        "gpt-4o",
+        "gpt-4o-mini",
+        "gpt-4o-mini-2024-07-18",
+        "gpt-4o-2024-05-13",
+        "gpt-4o-2024-08-06",
+        "gpt-4o-2024-11-20",
+        "gpt-3.5-turbo",
+        "gpt-3.5-turbo-0613",
+        "gpt-5-mini",
+        "gpt-5.3-codex",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.5",
+        "gpt-5.6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "claude-haiku-4.5",
+        "claude-opus-4.5",
+        "claude-opus-4.6",
+        "claude-opus-4.7",
+        "claude-opus-4.8",
+        "claude-opus-5",
+        "claude-sonnet-4.5",
+        "claude-sonnet-4.6",
+        "claude-sonnet-5",
+        "gemini-3.1-pro-preview",
+        "gemini-3.5-flash",
+        "gemini-3.6-flash",
+        "kimi-k2.7-code",
+        "mai-code-1-flash-picker",
+    }
+)
+
+_MODEL_NORMALIZATION_STRIP_RE = re.compile(r"[()]")
+_MODEL_NORMALIZATION_WHITESPACE_RE = re.compile(r"\s+")
+
+#: Explicit aliases for common nicknames that don't derive from casing/
+#: whitespace normalization alone (e.g. "GPT Sol" is missing the "5.6"
+#: version segment present in the real ID "gpt-5.6-sol"). Keys must already
+#: be lowercased/hyphenated (i.e. in the same shape normalization produces).
+_MODEL_NICKNAME_ALIASES: dict[str, str] = {
+    "gpt-sol": "gpt-5.6-sol",
+    "sol": "gpt-5.6-sol",
+    "gpt-luna": "gpt-5.6-luna",
+    "luna": "gpt-5.6-luna",
+    "gpt-terra": "gpt-5.6-terra",
+    "terra": "gpt-5.6-terra",
+}
+
+
+def normalize_copilot_model_id(model: str | None) -> str | None:
+    """Best-effort correction of a casually-typed model name to its API ID.
+
+    Clients occasionally send a human-readable model label instead of the
+    exact Copilot API model ID -- e.g. an orchestrating agent asked to
+    "review with Claude Opus 4.8" may pass the literal string
+    ``"Claude Opus 4.8"`` as the ``model`` field instead of
+    ``"claude-opus-4.8"``. GitHub's hosted API does not accept these labels
+    and rejects them with ``400 The requested model is not supported``.
+
+    This normalizes casing/whitespace/parentheses (``"Claude Opus 4.8"`` ->
+    ``"claude-opus-4.8"``, ``"Gemini 3.1 Pro (Preview)"`` ->
+    ``"gemini-3.1-pro-preview"``) and only substitutes the result if it
+    matches a known Copilot model ID or a known nickname alias (e.g. "GPT
+    Sol" -> "gpt-5.6-sol") -- an ambiguous or unrecognized label (e.g. bare
+    "Gemini", which could mean any of several Gemini models) is left
+    untouched rather than guessed, so an unresolvable name still fails with
+    a clear upstream error instead of silently being routed to the wrong
+    model.
+    """
+    if not model or model in _KNOWN_COPILOT_MODEL_IDS:
+        return model
+    normalized = _MODEL_NORMALIZATION_STRIP_RE.sub("", model).strip().lower()
+    normalized = _MODEL_NORMALIZATION_WHITESPACE_RE.sub("-", normalized)
+    if normalized in _KNOWN_COPILOT_MODEL_IDS:
+        return normalized
+    aliased = _MODEL_NICKNAME_ALIASES.get(normalized)
+    if aliased is not None:
+        return aliased
+    return model
+
+
+def resolve_copilot_model_id(
+    model: str | None,
+    *,
+    upstream_base_url: str | None,
+    cards: Any = None,
+) -> str | None:
+    """Correct a casually-typed model label, but only for Copilot upstreams.
+
+    Two properties matter here, both learned from review:
+
+    **Gating.** The alias/label table is Copilot-specific, so applying it to
+    every OpenAI-surface request would rewrite models destined for direct
+    OpenAI or a custom ``x-headroom-base-url`` upstream -- a custom upstream
+    that legitimately accepts ``"Sol"`` would silently receive
+    ``"gpt-5.6-sol"``. Normalization therefore happens only once the upstream
+    is known to be Copilot.
+
+    **Live catalog first.** When a catalog is available its ``name`` field is
+    the authoritative source for display labels ("Claude Opus 4.6" ->
+    ``claude-opus-4.6``), which keeps corrections current as GitHub ships and
+    retires models. The static table remains as a fallback and still carries
+    the short nicknames (``sol``/``luna``/``terra``) that no published ``name``
+    would produce.
+
+    Returns the model unchanged when it is already canonical, when the upstream
+    is not Copilot, or when the label is unrecognized *or ambiguous* -- an
+    unresolvable name must fail loudly upstream rather than be guessed.
+    """
+    if not isinstance(model, str) or not model:
+        return model
+    if not upstream_base_url or not is_copilot_api_url(upstream_base_url):
+        return model
+    # VS Code registers chat models under a prefixed id so its picker does not
+    # collapse them into Copilot's native entry (see `VSCODE_MODEL_ID_PREFIX`).
+    # Undo that here -- ahead of catalog lookup and of transport planning, both
+    # of which match on the real id -- so a prefixed model routes and bills
+    # exactly like the unprefixed one. Copilot-gated above, and no other client
+    # sends this prefix, so every existing caller is untouched.
+    if model.startswith(VSCODE_MODEL_ID_PREFIX):
+        unprefixed = model[len(VSCODE_MODEL_ID_PREFIX) :]
+        if unprefixed:
+            model = unprefixed
+    if cards:
+        from headroom.models.copilot_catalog import resolve_model_id
+
+        resolved = resolve_model_id(model, cards)
+        if resolved:
+            return resolved
+    return normalize_copilot_model_id(model)
 
 
 def _normalize_openai_max_tokens(
@@ -385,6 +530,26 @@ def _resolve_openai_chat_handler_path(base_url: str, model: str | None) -> str:
     if is_copilot_api_url(base_url) and model_prefers_responses_api(model):
         return _OPENAI_RESPONSES_PATH
     return _OPENAI_CHAT_COMPLETIONS_PATH
+
+
+def _resolve_openai_responses_handler_path(base_url: str, model: str | None) -> str:
+    """Return the upstream path suffix for an OpenAI Responses-API request.
+
+    GitHub Copilot's hosted API only serves gpt-5*/o1*/o3* reasoning models via
+    ``/responses``; every other model family (gpt-4.x, Claude, Gemini, etc.) is
+    only served via ``/chat/completions``. A Copilot session pins one wire API
+    for the whole process based on the *main* model, so once the main model is
+    a reasoning model, the CLI sends every request on that connection --
+    including subagent ("task tool") requests for a different, non-reasoning
+    model -- to ``/v1/responses``. Forwarding those verbatim causes GitHub's
+    hosted API to reject them with ``400 unsupported_api_for_model``. Route
+    those specific requests to ``/chat/completions`` instead, mirroring
+    ``_resolve_openai_chat_handler_path``'s Copilot-aware routing in the
+    opposite direction.
+    """
+    if is_copilot_api_url(base_url) and not model_prefers_responses_api(model):
+        return _OPENAI_CHAT_COMPLETIONS_PATH
+    return _OPENAI_RESPONSES_PATH
 
 
 def _append_request_query(url: str, query: str) -> str:
@@ -773,10 +938,23 @@ def _ensure_chatgpt_responses_store_false(
     payload: dict[str, Any],
     *,
     is_chatgpt_auth: bool,
+    is_copilot_upstream: bool = False,
 ) -> bool:
-    """Return True when ChatGPT auth requires and receives a store rewrite."""
+    """Force ``store: false`` where the upstream refuses server-side storage.
 
-    if is_chatgpt_auth and payload.get("store") is not False:
+    ChatGPT auth has always needed this. GitHub Copilot's hosted API needs it
+    too, though only for the *true* case -- measured against the live API:
+    ``store: true`` returns ``400 store is not supported`` while ``store: false``
+    and an absent ``store`` both return 200. VS Code's BYOK client sends
+    ``store: true`` on every ``/responses`` request unless the model is declared
+    zero-data-retention, so without this rewrite those models fail on first use.
+
+    Returns True when a rewrite happened, so the caller can log it **and mark the
+    body mutated**: the forwarder replays the original bytes verbatim for an
+    unmutated body, so a body nothing else touched would lose this rewrite.
+    """
+
+    if (is_chatgpt_auth or is_copilot_upstream) and payload.get("store") is not False:
         payload["store"] = False
         return True
     return False
@@ -1172,6 +1350,211 @@ def _openai_responses_to_sse(response: dict[str, Any]) -> list[bytes]:
     return events
 
 
+def _responses_body_to_chat_completion_body(
+    model: str, responses_body: dict[str, Any], *, plan: Any = None
+) -> dict[str, Any]:
+    """Convert a Responses-API request body into a Chat-Completions request body.
+
+    Used when a Copilot-hosted /responses request is downgraded to
+    /chat/completions by `_resolve_openai_responses_handler_path` (non-reasoning
+    model on a session pinned to the Responses wire API, see #1745 / #2643).
+    GitHub's /chat/completions endpoint requires a `messages` array and rejects
+    Responses-shaped bodies (`input`/`instructions`) with 400 "messages must be
+    non-empty". Delegates to litellm's own Responses<->Chat-Completions bridge
+    (the same transform litellm uses internally for providers that only
+    implement `.completion()`) rather than hand-rolling item/message parsing.
+
+    Always forces ``stream: false`` on the returned body: the upstream reply
+    is buffered and translated back to a Responses-API JSON object, then (if
+    the client asked for streaming) replayed as synthetic SSE via
+    `_openai_responses_to_sse`, mirroring the existing buffered-CCR path.
+    True incremental token streaming is not attempted for this bridged case.
+    """
+    from litellm.responses.litellm_completion_transformation.transformation import (
+        LiteLLMCompletionResponsesConfig,
+    )
+
+    chat_kwargs = (
+        LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
+            model=model,
+            input=responses_body.get("input", ""),
+            responses_api_request=responses_body,
+            stream=False,
+        )
+    )
+    # Drop litellm-internal plumbing keys that aren't valid OpenAI
+    # chat-completions wire fields.
+    chat_kwargs.pop("custom_llm_provider", None)
+    chat_kwargs.pop("extra_headers", None)
+    chat_kwargs.pop("context_management", None)
+    # This bridge only ever runs for non-reasoning models (see
+    # _resolve_openai_responses_handler_path: it downgrades to
+    # /chat/completions precisely when model_prefers_responses_api(model) is
+    # False). A Copilot session pinned to the Responses wire API by a
+    # reasoning main model still puts `reasoning: {effort: ...}` on every
+    # request on that connection, including subagent requests for a
+    # different, non-reasoning model. Forwarding that as `reasoning_effort`
+    # to a model that doesn't support it causes GitHub's hosted API to
+    # either reject the request outright ("reasoning_effort ... was
+    # provided, but model X does not support reasoning effort") or -- worse
+    # -- silently return an empty completion. Drop it unconditionally here.
+    _coerce_reasoning_effort(chat_kwargs)
+    _apply_plan_reasoning_effort(chat_kwargs, plan)
+    # Also drop optional fields that are either OpenAI/Responses-specific
+    # extensions or not universally supported across the model families
+    # this bridge targets (Claude, Gemini, older GPT); GitHub's
+    # /chat/completions endpoint appears to validate the body strictly and
+    # rejects unrecognized/unsupported fields with 400 "Request body JSON
+    # is invalid" rather than ignoring them.
+    chat_kwargs.pop("web_search_options", None)
+    chat_kwargs.pop("service_tier", None)
+    chat_kwargs.pop("metadata", None)
+    _use_max_completion_tokens(chat_kwargs)
+    chat_kwargs["stream"] = False
+    return chat_kwargs
+
+
+def _apply_plan_reasoning_effort(chat_kwargs: dict[str, Any], plan: Any) -> None:
+    """Drop or clamp ``reasoning_effort`` per the target model's capabilities.
+
+    Without a plan (no catalog, planning failed) this drops the field
+    unconditionally, which is the behaviour that shipped before and is always
+    safe. With a plan it keeps reasoning for models that support it -- dropping
+    it for ``claude-opus-4.8``, which accepts ``reasoning_effort`` upstream,
+    silently downgraded exactly the high-capability subagent this bridge exists
+    to reach -- and clamps a value the target model does not accept, since both
+    ``xhigh`` on ``claude-opus-4.6`` and ``max`` on ``gpt-5.4`` are hard 400s.
+    """
+    if plan is None:
+        chat_kwargs.pop("reasoning_effort", None)
+        return
+    if "reasoning_effort" in getattr(plan, "drop_fields", ()):
+        chat_kwargs.pop("reasoning_effort", None)
+        return
+    clamped = (getattr(plan, "clamp", None) or {}).get("reasoning_effort")
+    if clamped and chat_kwargs.get("reasoning_effort") is not None:
+        chat_kwargs["reasoning_effort"] = clamped
+    max_output = (getattr(plan, "clamp", None) or {}).get("max_output_tokens")
+    if max_output:
+        # Bridged requests go upstream with `stream: false`, and several model
+        # families cap non-streaming output well below their streaming ceiling.
+        current = chat_kwargs.get("max_tokens") or chat_kwargs.get("max_completion_tokens")
+        if current is None or current > max_output:
+            chat_kwargs.pop("max_tokens", None)
+            chat_kwargs["max_completion_tokens"] = max_output
+
+
+def _inbound_reasoning_effort(body: dict[str, Any]) -> str | None:
+    """The client's requested ``reasoning.effort``, when it sent a string one."""
+    reasoning = body.get("reasoning")
+    effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
+    return effort if isinstance(effort, str) else None
+
+
+def _inbound_max_output_tokens(body: dict[str, Any]) -> int | None:
+    """The client's requested ``max_output_tokens``, when it sent an int one."""
+    value = body.get("max_output_tokens")
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _coerce_reasoning_effort(chat_kwargs: dict[str, Any]) -> None:
+    """Flatten litellm's ``reasoning_effort`` to the string the wire expects.
+
+    litellm returns the **entire** ``reasoning`` object as ``reasoning_effort``
+    when the Responses request carried a ``summary`` -- i.e.
+    ``{"effort": "high", "summary": "detailed"}`` lands on a field whose wire
+    type is a string enum. Today that is invisible because the key is popped
+    unconditionally straight after; the moment retention becomes conditional
+    (keeping the value for models that do support it) an un-coerced dict would
+    be forwarded and rejected. Normalizing here keeps that latent bug from
+    surfacing the day retention is switched on.
+    """
+    effort = chat_kwargs.get("reasoning_effort")
+    if isinstance(effort, dict):
+        inner = effort.get("effort")
+        if isinstance(inner, str) and inner:
+            chat_kwargs["reasoning_effort"] = inner
+        else:
+            chat_kwargs.pop("reasoning_effort", None)
+
+
+def _use_max_completion_tokens(chat_kwargs: dict[str, Any]) -> None:
+    """Send ``max_completion_tokens``; never ``max_tokens``.
+
+    litellm maps the Responses field ``max_output_tokens`` onto ``max_tokens``,
+    which is the naive mapping and is rejected by ``gpt-5.4`` with
+    ``400 Unsupported parameter: 'max_tokens' is not supported with this
+    model. Use 'max_completion_tokens' instead.`` Probing the ten models this
+    bridge can realistically target found ``max_completion_tokens`` accepted by
+    every one of them and ``max_tokens`` accepted by all but ``gpt-5.4``, so
+    the newer name is strictly safer. Also closes #1904.
+    """
+    if "max_tokens" not in chat_kwargs:
+        return
+    value = chat_kwargs.pop("max_tokens")
+    if value is not None and chat_kwargs.get("max_completion_tokens") is None:
+        chat_kwargs["max_completion_tokens"] = value
+
+
+def _chat_completion_json_to_responses_json(
+    *,
+    responses_api_request: dict[str, Any],
+    chat_completion_json: dict[str, Any],
+) -> dict[str, Any]:
+    """Convert a raw Chat-Completions JSON reply into a Responses-API JSON body.
+
+    Mirror image of `_responses_body_to_chat_completion_body` for the reply
+    direction: GitHub's /chat/completions endpoint replies with
+    `choices[].message`, but the client called /v1/responses and expects a
+    Responses-API shaped reply (`output[]`, `usage.input_tokens`, ...). Uses
+    litellm's own transform so tool calls, finish_reason, and usage map
+    correctly.
+    """
+    from litellm.responses.litellm_completion_transformation.transformation import (
+        LiteLLMCompletionResponsesConfig,
+    )
+
+    responses_api_response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+        request_input=responses_api_request.get("input", ""),
+        responses_api_request=responses_api_request,
+        chat_completion_response=chat_completion_json,
+    )
+    translated = responses_api_response.model_dump(exclude_none=True, mode="json")
+    _drop_fabricated_zero_usage(translated, chat_completion_json)
+    return translated
+
+
+def _drop_fabricated_zero_usage(
+    translated: dict[str, Any], chat_completion_json: dict[str, Any]
+) -> None:
+    """Remove an all-zero ``usage`` block litellm invented from nothing.
+
+    When the upstream reply carries no ``usage`` (or an explicit ``null``),
+    litellm's transform still emits
+    ``{"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}``. Those zeros
+    are actively harmful here: the caller reads them with ``_usage_int(value,
+    fallback)``, whose fallback only fires on a *missing or unparseable* value.
+    A real ``0`` is parseable, so it wins -- and the request records zero tokens
+    into metrics, the cost tracker, the savings ledger, and the request log,
+    instead of falling back to Headroom's own token estimate.
+
+    Deleting the fabricated block restores "upstream said nothing about usage",
+    which is the truth and which the fallback already handles correctly. A
+    genuine all-zero usage from upstream is indistinguishable and equally
+    uninteresting, so nothing of value is lost.
+    """
+    usage = translated.get("usage")
+    if not isinstance(usage, dict):
+        return
+    if any(usage.get(k) for k in ("input_tokens", "output_tokens", "total_tokens")):
+        return  # real numbers present; leave untouched
+    upstream_usage = chat_completion_json.get("usage")
+    if not isinstance(upstream_usage, dict) or not any(
+        upstream_usage.get(k) for k in ("prompt_tokens", "completion_tokens", "total_tokens")
+    ):
+        translated.pop("usage", None)
+
+
 def _openai_responses_from_sse(sse_text: str) -> dict[str, Any] | None:
     """Reassemble the final Responses API JSON body from an SSE stream.
 
@@ -1516,6 +1899,260 @@ class OpenAIHandlerMixin:
         from headroom.proxy.token_counting import count_tokens_offloaded
 
         return await count_tokens_offloaded(self, model, messages)
+
+    def _resolved_openai_upstream_base(self, request: Request) -> str:
+        """Upstream this request will actually reach (custom header wins)."""
+        return _resolve_openai_upstream_base(request.headers) or self.OPENAI_API_URL
+
+    def _maybe_normalize_copilot_model(
+        self,
+        request: Request,
+        body: dict[str, Any],
+        model: Any,
+        body_mutation_tracker: BodyMutationTracker | None,
+        request_id: str,
+    ) -> Any:
+        """Rewrite a casually-typed model label in ``body``, Copilot only.
+
+        Shared by both OpenAI inbound surfaces. Wiring this into
+        ``/v1/chat/completions`` as well as ``/v1/responses`` is the point: a
+        Copilot session's wire API defaults to ``completions`` for every
+        non-reasoning main model, so the chat surface is the *common* path, and
+        leaving it unnormalized meant the exact scenario this correction exists
+        for -- an orchestrating agent passing ``"Claude Opus 4.8"`` -- still
+        failed with a 400 whenever the session was not pinned to ``responses``.
+
+        Returns the (possibly corrected) model. Never raises.
+        """
+        if not isinstance(model, str) or not model:
+            return model
+        try:
+            resolved = resolve_copilot_model_id(
+                model,
+                upstream_base_url=self._resolved_openai_upstream_base(request),
+                cards=self._copilot_catalog_cards(request),
+            )
+        except Exception:  # noqa: BLE001 — name correction must never break a request
+            logger.debug("[%s] model-id normalization failed; leaving as-is", request_id)
+            return model
+        if not resolved or resolved == model:
+            return model
+        logger.info(
+            "[%s] Normalized casually-typed model name %r -> %r",
+            request_id,
+            model,
+            resolved,
+        )
+        body["model"] = resolved
+        if body_mutation_tracker is not None:
+            body_mutation_tracker.mark_mutated("model_id_normalization")
+        return resolved
+
+    def _copilot_catalog_cards(self, request: Request) -> Any:
+        """Already-cached cards for this request's credential, or ``None``.
+
+        Synchronous and cache-only by design: name normalization sits on the hot
+        path, so it reads whatever a previous request already fetched and never
+        blocks on discovery. Absence is a normal outcome that every caller
+        handles by falling back to the static table and the name heuristic.
+        """
+        catalog = getattr(self, "_copilot_catalog", None)
+        if catalog is None:
+            return None
+        try:
+            # Goes through `cards()` rather than reading `_entries`: that accessor
+            # is where the staleness bound lives, and bypassing it let name
+            # normalization run off an arbitrarily old catalog.
+            return catalog.cards(self._copilot_catalog_key(request))
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _copilot_catalog_key(self, request: Request) -> tuple[str, str, str]:
+        """Cache identity: upstream + integration id + credential fingerprint.
+
+        All three matter. Copilot entitlements differ per token, ``/models``
+        rejects an unknown ``Copilot-Integration-Id`` outright, and Enterprise
+        tenants sit on their own host -- so a catalog fetched under one identity
+        does not describe traffic sent under another.
+
+        The fingerprint must track the credential the fetch will *actually* use.
+        ``apply_copilot_api_auth`` forwards the client's own bearer when it is
+        forwardable and only otherwise falls back to the proxy's env token, so
+        keying purely on the env var collapsed to a process-lifetime constant and
+        let two clients with different Copilot tokens share one entry -- exactly
+        the sharing this key exists to prevent. Mirror that decision here.
+        """
+        from headroom.copilot_auth import (
+            _is_forwardable_copilot_bearer_token,
+            _is_managed_copilot_seeded_bearer,
+            token_fingerprint,
+        )
+        from headroom.models.copilot_catalog import CopilotModelCatalog
+
+        base_url = self._resolved_openai_upstream_base(request)
+        integration_id = os.environ.get("GITHUB_COPILOT_INTEGRATION_ID", "vscode-chat")
+        token = ""
+        inbound = request.headers.get("authorization") or ""
+        scheme, _, raw = inbound.partition(" ")
+        if scheme.lower() == "bearer" and raw:
+            try:
+                if _is_forwardable_copilot_bearer_token(
+                    raw
+                ) and not _is_managed_copilot_seeded_bearer(raw):
+                    token = raw
+            except Exception:  # noqa: BLE001 — fall back to the env token
+                token = ""
+        token = token or os.environ.get("GITHUB_COPILOT_API_TOKEN", "")
+        try:
+            fingerprint = token_fingerprint(token) if token else ""
+        except Exception:  # noqa: BLE001
+            fingerprint = ""
+        return CopilotModelCatalog.cache_key(
+            base_url=base_url,
+            integration_id=integration_id,
+            token_fingerprint=fingerprint,
+        )
+
+    async def _plan_responses_upstream_path(
+        self,
+        request: Request,
+        headers: dict[str, str],
+        *,
+        model: Any,
+        base_url: str,
+        body: dict[str, Any],
+    ) -> Any:
+        """Return the ``TransportPlan`` for a ``/v1/responses`` request.
+
+        Prefers the catalog's published ``supported_endpoints`` and falls back
+        to the legacy name heuristic whenever the catalog cannot answer -- which
+        covers a disabled catalog, an unreachable ``/models``, a model the
+        account is not served, and the 17-of-40 live models that publish no
+        endpoint list at all. That fallback is what makes this a strict
+        improvement rather than a new class of misroute.
+
+        The heuristic alone is wrong in the unsafe direction for at least one
+        real model: ``mai-code-1-flash-picker`` is served only on ``/responses``
+        but does not match ``gpt-5*/o1*/o3*``, so name-based routing downgrades
+        it to ``/chat/completions`` and turns a working request into a 400.
+
+        **Returns the plan rather than stashing it on ``self``.** An earlier
+        version assigned ``self._last_transport_plan`` and had the caller read it
+        back, but ``self`` is the process-wide proxy and this coroutine suspends
+        on the catalog fetch. On the exception path the attribute was left
+        holding whichever plan another in-flight request had stored, so a
+        request could be bridged using a *different model's* capability
+        decisions -- reinstating exactly the ``reasoning_effort`` 400 that
+        #f3771695 removed, nondeterministically, under the concurrent subagent
+        fan-out this feature exists to serve. Per-request state must travel with
+        the request.
+        """
+        from headroom.proxy.transport_planner import plan_transport
+
+        heuristic = _resolve_openai_responses_handler_path(base_url, model)
+
+        def _heuristic_plan() -> Any:
+            # Build a real plan for the fallback too, so the returned plan and
+            # the returned path can never disagree. `card=None` on a bridged
+            # route yields drop_fields=("reasoning_effort",) -- the pre-existing,
+            # always-safe behaviour.
+            return plan_transport(
+                inbound_path=_OPENAI_RESPONSES_PATH,
+                card=None,
+                heuristic_prefers_responses=(heuristic == _OPENAI_RESPONSES_PATH),
+                reasoning_effort=_inbound_reasoning_effort(body),
+                requested_max_output_tokens=_inbound_max_output_tokens(body),
+            )
+
+        if not isinstance(model, str) or not model or not is_copilot_api_url(base_url):
+            return _heuristic_plan()
+        try:
+            cards = await self._ensure_copilot_catalog(request, headers)
+            card = (cards or {}).get(model)
+            if card is not None and not card.is_chat_model:
+                card = None
+            plan = plan_transport(
+                inbound_path=_OPENAI_RESPONSES_PATH,
+                card=card,
+                heuristic_prefers_responses=(heuristic == _OPENAI_RESPONSES_PATH),
+                reasoning_effort=_inbound_reasoning_effort(body),
+                requested_max_output_tokens=_inbound_max_output_tokens(body),
+            )
+        except Exception:  # noqa: BLE001 — routing must never regress to an error
+            logger.debug("transport planning failed; using name heuristic", exc_info=True)
+            return _heuristic_plan()
+        if plan.upstream_path != heuristic:
+            logger.info("transport plan: %s", plan.reason)
+        return plan
+
+    async def _ensure_copilot_catalog(self, request: Request, headers: dict[str, str]) -> Any:
+        """Populate the catalog for this credential if not already fresh.
+
+        Awaited once per request on the Copilot path, before routing. Returns
+        the cards or ``None``. Never raises and never propagates a failure: an
+        unreachable ``/models`` leaves the caller on today's heuristic.
+        """
+        from headroom.models.copilot_catalog import (
+            CopilotModelCatalog,
+            catalog_enabled,
+            fetch_cards,
+        )
+
+        base_url = self._resolved_openai_upstream_base(request)
+        if not catalog_enabled() or not is_copilot_api_url(base_url):
+            return None
+        catalog = getattr(self, "_copilot_catalog", None)
+        if catalog is None:
+            catalog = CopilotModelCatalog()
+            self._copilot_catalog = catalog
+        key = self._copilot_catalog_key(request)
+        cached = catalog.cards(key)
+        if cached is not None and (catalog.is_fresh(key) or catalog.refresh_suppressed(key)):
+            return cached
+        if self.http_client is None:
+            return None
+
+        # Single-flight per credential. Without this, an N-way subagent fan-out
+        # on a cold cache issues N parallel `/models` GETs and every one of those
+        # requests waits out the fetch timeout before it can route -- a latency
+        # cliff that did not exist before, since routing used to be pure string
+        # matching. One fetch serves the whole wave.
+        lock = catalog.fetch_lock(key)
+        async with lock:
+            cached = catalog.cards(key)
+            if cached is not None and (catalog.is_fresh(key) or catalog.refresh_suppressed(key)):
+                return cached
+            # `/models` needs the same auth and the same Copilot-Integration-Id as
+            # the traffic it describes -- the endpoint 400s on an unknown integration
+            # id, and entitlements differ per token. Reusing the request path's own
+            # auth helper is what keeps the catalog describing *this* credential
+            # rather than some other lane's.
+            catalog_headers = {
+                k: v
+                for k, v in headers.items()
+                if k.lower()
+                not in (
+                    "content-length",
+                    "content-type",
+                    "host",
+                    "accept-encoding",
+                    "content-encoding",
+                )
+            }
+            catalog_headers = await apply_copilot_api_auth(
+                catalog_headers, url=f"{base_url}/models"
+            )
+            cards = await fetch_cards(self.http_client, base_url=base_url, headers=catalog_headers)
+            if cards:
+                catalog.put(key, cards)
+                return cards
+            # A failed fetch must NOT overwrite a good catalog with {}: that would
+            # destroy working routing for a full TTL over one transient blip, and
+            # silently revert models like mai-code-1-flash-picker to the heuristic
+            # that 400s them. Record the failure under a short backoff instead and
+            # keep serving what we already had, up to the staleness bound.
+            catalog.note_fetch_failure(key)
+            return catalog.cards(key)
 
     OPENAI_RESPONSES_ROUTER_MIN_BYTES = 512
     OPENAI_RESPONSES_OUTPUT_TYPES = _RESPONSES_OUTPUT_ITEM_TYPES
@@ -2993,6 +3630,18 @@ class OpenAIHandlerMixin:
         original_client_messages = copy.deepcopy(messages)
         custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
         upstream_base_url = self._resolve_openai_upstream(request)
+        # Normalize before routing: the wire API is chosen from the model, so a
+        # label like "Claude Opus 4.8" must become `claude-opus-4.8` first or
+        # the route is computed from a name the upstream would reject anyway.
+        # Skipped under an explicit bypass, mirroring the responses handler.
+        if not (
+            request.headers.get("x-headroom-bypass", "").lower() == "true"
+            or request.headers.get("x-headroom-mode", "").lower() == "passthrough"
+        ):
+            # The chat path re-serializes `body` before forwarding rather than
+            # byte-forwarding the client's original bytes, so it needs no
+            # mutation tracker (see the note at the tool-injection site below).
+            model = self._maybe_normalize_copilot_model(request, body, model, None, request_id)
         handler_path_suffix = _resolve_openai_chat_handler_path(
             upstream_base_url,
             model,
@@ -5010,6 +5659,15 @@ class OpenAIHandlerMixin:
                 "[%s] Responses passthrough reason=bypass_header mutation=disabled",
                 request_id,
             )
+        # Model-id normalization deliberately runs AFTER the bypass gate: an
+        # explicit bypass means "forward my bytes untouched", and rewriting the
+        # model would violate that. It is also gated on the upstream actually
+        # being Copilot, so a direct-OpenAI or custom `x-headroom-base-url`
+        # upstream never receives Copilot-specific corrections.
+        if not _bypass:
+            model = self._maybe_normalize_copilot_model(
+                request, body, model, body_mutation_tracker, request_id
+            )
 
         from headroom.proxy.helpers import capture_codex_wire_debug
 
@@ -5095,8 +5753,17 @@ class OpenAIHandlerMixin:
         headers, is_chatgpt_auth = _resolve_codex_routing_headers(headers)
         if is_chatgpt_auth:
             client = "codex"
-        if _ensure_chatgpt_responses_store_false(body, is_chatgpt_auth=is_chatgpt_auth):
-            logger.info(f"[{request_id}] Responses: forced store=false for ChatGPT auth")
+        if _ensure_chatgpt_responses_store_false(
+            body,
+            is_chatgpt_auth=is_chatgpt_auth,
+            is_copilot_upstream=is_copilot_api_url(self._resolved_openai_upstream_base(request)),
+        ):
+            logger.info(f"[{request_id}] Responses: forced store=false (upstream rejects it)")
+            # Belt and braces: today other mutations happen to mark this body,
+            # so the rewrite survives by accident. Marking it here means the
+            # request stops depending on that accident.
+            if body_mutation_tracker is not None:
+                body_mutation_tracker.mark_mutated("responses_store_false")
         responses_memory_tools_allowed = _allow_responses_memory_tools(is_chatgpt_auth)
 
         # PR-A6 (P5-50, preps P0-6): session-sticky `OpenAI-Beta` merge
@@ -5375,17 +6042,45 @@ class OpenAIHandlerMixin:
 
         # Route to correct endpoint based on auth mode.
         # ChatGPT session auth (codex login) uses chatgpt.com, not api.openai.com.
+        # `is_copilot_chat_bridge` tracks whether _resolve_openai_responses_handler_path
+        # downgraded this Copilot-hosted request to /chat/completions (non-reasoning
+        # model on a session pinned to the Responses wire API, see #1745 / #2643).
+        # That endpoint requires a `messages` array and rejects Responses-shaped
+        # bodies (`input`/`instructions`) with 400 "messages must be non-empty", so
+        # the request/response bodies must be bridged between the two API shapes
+        # further down (see the `_buffered_ccr_operation` closure below).
+        is_copilot_chat_bridge = False
+        transport_plan = None
         if is_chatgpt_auth:
             url = codex_responses_http_url()
         else:
-            upstream_base_url = _resolve_openai_upstream_base(request.headers)
+            custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
+            resolved_upstream_base_url = custom_upstream_base_url or self.OPENAI_API_URL
+            if _bypass:
+                # An explicit bypass means "forward my bytes untouched", and the
+                # model-normalization gate above already honours that. Rerouting
+                # the request to a different endpoint AND rewriting the body into
+                # a different API shape would break the same promise far more
+                # severely, so planning is skipped entirely: this reproduces
+                # origin/main's behaviour of always sending /v1/responses verbatim.
+                handler_path_suffix = _OPENAI_RESPONSES_PATH
+            else:
+                transport_plan = await self._plan_responses_upstream_path(
+                    request,
+                    headers,
+                    model=model,
+                    base_url=resolved_upstream_base_url,
+                    body=body,
+                )
+                handler_path_suffix = transport_plan.upstream_path
+            is_copilot_chat_bridge = handler_path_suffix == _OPENAI_CHAT_COMPLETIONS_PATH
             handler_path = (
-                _resolve_openai_handler_path(request.headers, handler_path=_OPENAI_RESPONSES_PATH)
-                if upstream_base_url is not None
-                else "/v1/responses"
+                _resolve_openai_handler_path(request.headers, handler_path=handler_path_suffix)
+                if custom_upstream_base_url is not None
+                else f"/v1{handler_path_suffix}"
             )
             url = build_copilot_upstream_url(
-                upstream_base_url or self.OPENAI_API_URL,
+                resolved_upstream_base_url,
                 handler_path,
             )
             url = _append_request_query(url, request.url.query)
@@ -5583,8 +6278,17 @@ class OpenAIHandlerMixin:
                 "upstream request for server-side retrieval handling"
             )
 
+        if is_copilot_chat_bridge and stream:
+            logger.info(
+                f"[{request_id}] Copilot responses/chat-completions bridge: "
+                f"model {model} does not support /responses on Copilot's hosted "
+                "API; using a buffered stream:false /chat/completions request, "
+                "translating the reply back to Responses-API shape, and "
+                "replaying it as synthetic SSE for the client."
+            )
+
         try:
-            if stream and not buffered_stream_ccr:
+            if stream and not buffered_stream_ccr and not is_copilot_chat_bridge:
                 # Streaming for Responses API uses semantic events
                 return await self._stream_response(
                     url,
@@ -5611,11 +6315,19 @@ class OpenAIHandlerMixin:
                 async def _buffered_ccr_operation():
                     nonlocal headers
                     headers = await apply_copilot_api_auth(headers, url=url)
+                    outbound_body = body
+                    if is_copilot_chat_bridge:
+                        outbound_body = _responses_body_to_chat_completion_body(
+                            model, body, plan=transport_plan
+                        )
+                        body_mutation_tracker.mark_mutated(
+                            "copilot_responses_to_chat_completions_bridge"
+                        )
                     response = await self._retry_request(
                         "POST",
                         url,
                         headers,
-                        body,
+                        outbound_body,
                         original_body_bytes=original_body_bytes,
                         body_mutated=body_mutation_tracker.mutated,
                         mutation_reasons=body_mutation_tracker.reasons,
@@ -5623,6 +6335,63 @@ class OpenAIHandlerMixin:
                         forwarder_name="openai_responses",
                         path_for_log=url,
                     )
+                    if is_copilot_chat_bridge and response.status_code == 200:
+                        try:
+                            translated_json = _chat_completion_json_to_responses_json(
+                                responses_api_request=body,
+                                chat_completion_json=response.json(),
+                            )
+                            response = httpx.Response(
+                                status_code=response.status_code,
+                                content=json.dumps(translated_json).encode(),
+                                headers={
+                                    k: v
+                                    for k, v in response.headers.items()
+                                    if k.lower() not in ("content-length", "content-encoding")
+                                },
+                            )
+                        except Exception as _bridge_exc:
+                            # Fail closed: the raw chat-completions reply is
+                            # NOT Responses-API shaped (no `output[]`), so
+                            # returning it untranslated with the original 200
+                            # would silently hand the client a malformed
+                            # success response it can't parse. An explicit
+                            # 502 is easier for the client to recover from.
+                            logger.error(
+                                f"[{request_id}] Copilot responses/chat-completions "
+                                "bridge: failed to translate the upstream "
+                                f"chat-completion reply back to Responses-API "
+                                f"shape: {type(_bridge_exc).__name__}: {_bridge_exc}"
+                            )
+                            response = httpx.Response(
+                                status_code=502,
+                                content=json.dumps(
+                                    {
+                                        "error": {
+                                            "message": (
+                                                "headroom: failed to translate the "
+                                                "Copilot chat-completions reply back "
+                                                "to Responses API shape."
+                                            ),
+                                            "type": "server_error",
+                                            "code": "copilot_responses_bridge_error",
+                                        }
+                                    }
+                                ).encode(),
+                                headers={
+                                    **{
+                                        k: v
+                                        for k, v in response.headers.items()
+                                        if k.lower()
+                                        not in (
+                                            "content-length",
+                                            "content-encoding",
+                                            "content-type",
+                                        )
+                                    },
+                                    "content-type": "application/json",
+                                },
+                            )
                     _response_body_for_debug: Any = None
                     _response_raw_for_debug: str | None = None
                     try:
@@ -6085,7 +6854,12 @@ class OpenAIHandlerMixin:
                     # Remove compression headers
                     response_headers = _sanitize_forwarded_response_headers(response.headers)
 
-                    if buffered_stream_ccr and response.status_code == 200 and resp_json:
+                    if (
+                        (buffered_stream_ccr or is_copilot_chat_bridge)
+                        and stream
+                        and response.status_code == 200
+                        and resp_json
+                    ):
                         sse_headers = {
                             k: v
                             for k, v in response_headers.items()
@@ -6171,7 +6945,7 @@ class OpenAIHandlerMixin:
                         headers=response_headers,
                     )
 
-            if buffered_stream_ccr:
+            if buffered_stream_ccr or (is_copilot_chat_bridge and stream):
                 operation = asyncio.create_task(_buffered_ccr_operation())
                 record_failed = self.metrics.record_failed
 
