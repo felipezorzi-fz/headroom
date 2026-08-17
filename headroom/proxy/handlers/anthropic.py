@@ -14,6 +14,7 @@ import time
 import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
 
@@ -36,7 +37,11 @@ from headroom.proxy.auth_mode import (
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
-from headroom.proxy.helpers import extract_tags, relocate_system_messages_to_top_level
+from headroom.proxy.helpers import (
+    extract_tags,
+    relocate_system_messages_to_top_level,
+    sanitize_forwarded_response_headers,
+)
 from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
@@ -44,6 +49,23 @@ from headroom.proxy.model_router import estimate_input_tokens
 from headroom.proxy.outcome import RequestOutcome
 
 logger = logging.getLogger("headroom.proxy")
+
+
+def _is_googleapis_endpoint(value: object) -> bool:
+    """Return whether *value* targets Google APIs by parsed hostname.
+
+    A substring check would also trust attacker-controlled hosts such as
+    ``googleapis.com.example.test``. URL parsing plus a label-boundary suffix
+    check accepts Google API subdomains without widening the route gate.
+    """
+    raw = str(value).strip()
+    if not raw:
+        return False
+    try:
+        hostname = (urlsplit(raw).hostname or "").rstrip(".").lower()
+    except ValueError:
+        return False
+    return hostname == "googleapis.com" or hostname.endswith(".googleapis.com")
 
 
 class _AnthropicTurnHookUsage:
@@ -1176,15 +1198,32 @@ class AnthropicHandlerMixin:
                         )
                     )
 
-                    # Remove compression headers from cached response
-                    response_headers = dict(cached.response_headers)
-                    response_headers.pop("content-encoding", None)
-                    response_headers.pop("content-length", None)
-                    # Drop the stored content-type too. Starlette lets an
-                    # explicit header win over ``media_type``, so keeping the
-                    # producing request's type would let a cache entry hand this
-                    # caller a wire format it never asked for (#2952).
-                    response_headers.pop("content-type", None)
+                    # Strip the stored response's wire-framing headers. The
+                    # entry carries whatever the *producing* upstream sent,
+                    # and replaying that framing over a different connection
+                    # breaks the body: a stale ``transfer-encoding: chunked``
+                    # makes the client parse plain JSON as chunked frames and
+                    # read nothing out of an HTTP 200 (#3019). ``content-type``
+                    # goes too, because Starlette lets an explicit header win
+                    # over ``media_type`` and the producing request's type
+                    # would hand this caller a wire format it never asked
+                    # for (#2952).
+                    response_headers = sanitize_forwarded_response_headers(
+                        cached.response_headers,
+                        "content-type",
+                    )
+
+                    # A cache hit answers the client without touching the
+                    # upstream, so it emits no outbound_request line and no
+                    # upstream stage timings. Without this log a served-from-
+                    # cache turn is indistinguishable from a turn that died
+                    # silently, which is exactly how #3019 stayed invisible.
+                    logger.info(
+                        f"[{request_id}] RESPONSE-CACHE-HIT: model={model} "
+                        f"bytes={len(cached.response_body)} "
+                        f"age_s={(datetime.now() - cached.created_at).total_seconds():.0f} "
+                        f"hits={cached.hit_count}"
+                    )
 
                     # Unit 4: release the pre-upstream semaphore on cache
                     # hit — no upstream call will happen.
@@ -1343,24 +1382,20 @@ class AnthropicHandlerMixin:
             # lossless whole-prefix recompaction instead of the byte-identical splice
             # (the splice preserves a dead cache) and skips the overlay replay. Both are
             # deterministic → the recompacted prefix re-caches byte-stable on warm turns.
+            from headroom.transforms.cold_prefix import (
+                anthropic_cache_ttl_seconds,
+                is_cold_prefix,
+            )
+
+            # Resolve the authoritative request-level prompt-cache tier once.
+            # The same value drives cold-prefix handling and net-cost pricing.
+            _cc_ttl = anthropic_cache_ttl_seconds(model, original_client_messages, system_prompt)
             _cold_recompact_active = False
             if os.environ.get("HEADROOM_COLD_RECOMPACT", "").strip().lower() in (
                 "1",
                 "true",
                 "yes",
             ):
-                from headroom.transforms.cold_prefix import (
-                    anthropic_cache_ttl_seconds,
-                    is_cold_prefix,
-                )
-
-                # Read CC's ACTUAL prompt-cache TTL (request cache_control.ttl + the
-                # DISABLE_/ENABLE_/FORCE_PROMPT_CACHING_* env controls) instead of the
-                # static 300s guess — a wrong TTL is exactly what busts a warm cache.
-                # None ⇒ caching is OFF (no cache to bust) ⇒ recompact every turn.
-                _cc_ttl = anthropic_cache_ttl_seconds(
-                    model, original_client_messages, system_prompt
-                )
                 _cold_recompact_active = _cc_ttl is None or is_cold_prefix(
                     prefix_tracker, ttl_seconds=_cc_ttl
                 )
@@ -1559,6 +1594,7 @@ class AnthropicHandlerMixin:
                                     biases=biases,
                                     request_id=request_id,
                                     compression_policy=compression_policy,
+                                    cache_ttl_seconds=_cc_ttl,
                                     **proxy_pipeline_kwargs(self.config),
                                 ),
                                 lambda bg_result: comp_cache.update_from_result(
@@ -1603,6 +1639,7 @@ class AnthropicHandlerMixin:
                                             biases=biases,
                                             request_id=request_id,
                                             compression_policy=compression_policy,
+                                            cache_ttl_seconds=_cc_ttl,
                                             skip_kompress=True,
                                             **proxy_pipeline_kwargs(self.config),
                                         ),
@@ -1653,6 +1690,7 @@ class AnthropicHandlerMixin:
                                         biases=biases,
                                         request_id=request_id,
                                         compression_policy=compression_policy,
+                                        cache_ttl_seconds=_cc_ttl,
                                         **proxy_pipeline_kwargs(self.config),
                                     ),
                                     timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -1694,6 +1732,7 @@ class AnthropicHandlerMixin:
                                     biases=biases,
                                     request_id=request_id,
                                     compression_policy=compression_policy,
+                                    cache_ttl_seconds=_cc_ttl,
                                     **proxy_pipeline_kwargs(self.config),
                                 ),
                                 timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -1826,6 +1865,7 @@ class AnthropicHandlerMixin:
                                         biases=biases,
                                         request_id=request_id,
                                         compression_policy=compression_policy,
+                                        cache_ttl_seconds=_cc_ttl,
                                         **proxy_pipeline_kwargs(self.config),
                                     ),
                                     timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -2990,7 +3030,19 @@ class AnthropicHandlerMixin:
             # the top-level 'system' parameter ..."), so relocate it back to the
             # top-level ``system`` parameter as the last step before forwarding.
             relocated_messages, relocated_system, system_relocated = (
-                relocate_system_messages_to_top_level(body["messages"], body.get("system"))
+                relocate_system_messages_to_top_level(
+                    body["messages"],
+                    body.get("system"),
+                    (
+                        str(model)
+                        if (
+                            not upstream_base_url
+                            or getattr(self, "anthropic_backend", None) is not None
+                            or _is_googleapis_endpoint(upstream_base_url)
+                        )
+                        else None
+                    ),
+                )
             )
             if system_relocated:
                 body["messages"] = relocated_messages
@@ -3370,6 +3422,44 @@ class AnthropicHandlerMixin:
                         body["tools"] = _ttl_tools
                     tools = _ttl_tools
                     body_mutation_tracker.mark_mutated("cache_control_ttl_order")
+
+                # Signed thinking locks the request to the client's original
+                # bytes. Once all mutation sites have run, make every downstream
+                # observer use that same wire body and neutralize savings from
+                # edits that will not be sent (#2990). This covers PERF, /stats,
+                # durable savings, response headers, pipeline events, and the
+                # prefix tracker rather than fixing only one reporting surface.
+                if outbound_locked_to_client_bytes and body_mutation_tracker.mutated:
+                    discarded_reasons = body_mutation_tracker.reasons
+                    try:
+                        wire_body = json.loads(original_body_bytes or b"")
+                    except (json.JSONDecodeError, UnicodeDecodeError, ValueError, RecursionError):
+                        wire_body = None
+                    if not isinstance(wire_body, dict):
+                        raise ValueError(
+                            "signed-thinking passthrough could not reconstruct its client wire body"
+                        )
+
+                    from headroom.proxy.savings_attribution import SAVINGS_ATTRIBUTION_TAG
+                    from headroom.proxy.tool_schema_savings_policy import (
+                        TOOL_SCHEMA_SAVINGS_TAGS,
+                    )
+
+                    attribution = tags.get(SAVINGS_ATTRIBUTION_TAG)
+                    if isinstance(attribution, list):
+                        attribution.clear()
+                    for savings_tag in TOOL_SCHEMA_SAVINGS_TAGS:
+                        tags.pop(savings_tag, None)
+                    tags.pop("tool_search_deferred_tools", None)
+                    tags["wire_mutations_discarded"] = len(discarded_reasons)
+                    tags["wire_mutation_reasons"] = ",".join(discarded_reasons)
+
+                    body = wire_body
+                    optimized_messages = body.get("messages", [])
+                    tools = body.get("tools")
+                    optimized_tokens = original_tokens
+                    tokens_saved = 0
+                    transforms_applied = []
 
                 log_cache_breakpoints(
                     request_id=request_id,
@@ -3991,7 +4081,24 @@ class AnthropicHandlerMixin:
                         # the key: the cache key has no ``stream`` component, so
                         # a buffered request would be answered with a stream it
                         # cannot read (#2952).
-                        if self.cache and response.status_code == 200 and resp_json is not None:
+                        #
+                        # ``not stream`` mirrors the read gate at the cache
+                        # lookup above. ``stream`` still holds the *client's*
+                        # original flag here — the buffered-CCR conversion
+                        # flips ``body["stream"]``, never this variable — so a
+                        # turn the client asked to stream is the one case that
+                        # can reach this store site with a buffered body. That
+                        # body was shaped by a forced ``stream: false`` flip
+                        # plus CCR tool injection, and the key cannot tell it
+                        # apart from an ordinary non-streaming reply, so
+                        # storing it lets a later caller be answered with a
+                        # response built for a request it never made (#3019).
+                        if (
+                            self.cache
+                            and not stream
+                            and response.status_code == 200
+                            and resp_json is not None
+                        ):
                             await self.cache.set(
                                 cache_lookup_messages,
                                 model,
@@ -4506,6 +4613,8 @@ class AnthropicHandlerMixin:
         compressed_requests = []
         pipeline_timing: dict[str, float] = {}
 
+        from headroom.transforms.cold_prefix import anthropic_cache_ttl_seconds
+
         # Apply compression to each request in the batch
         for batch_req in requests_list:
             custom_id = batch_req.get("custom_id", "")
@@ -4515,6 +4624,9 @@ class AnthropicHandlerMixin:
             messages = params.get("messages", [])
             original_messages = copy.deepcopy(messages)
             model = params.get("model", "unknown")
+            cache_ttl_seconds = anthropic_cache_ttl_seconds(
+                model, original_messages, params.get("system")
+            )
 
             if not messages or not self.config.optimize:
                 # No messages or optimization disabled - pass through unchanged
@@ -4551,7 +4663,7 @@ class AnthropicHandlerMixin:
                     # blocks every other request for the duration; a timeout
                     # here is caught below and passes the item through.
                     result = await self._run_compression_in_executor(
-                        lambda messages=messages, model=model, context_limit=context_limit, frozen_message_count=frozen_message_count: (
+                        lambda messages=messages, model=model, context_limit=context_limit, frozen_message_count=frozen_message_count, cache_ttl_seconds=cache_ttl_seconds: (
                             self.anthropic_pipeline.apply(
                                 messages=messages,
                                 model=model,
@@ -4559,6 +4671,7 @@ class AnthropicHandlerMixin:
                                 context=extract_user_query(messages),
                                 frozen_message_count=frozen_message_count,
                                 request_id=request_id,
+                                cache_ttl_seconds=cache_ttl_seconds,
                                 **proxy_pipeline_kwargs(self.config),
                             )
                         ),

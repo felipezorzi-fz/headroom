@@ -5,6 +5,7 @@ import os
 import sys
 import warnings
 from importlib import import_module
+from pathlib import Path
 from typing import Any, Literal, cast
 
 import click
@@ -111,6 +112,55 @@ def _get_env_bool_optional(name: str) -> bool | None:
     if name not in os.environ:
         return None
     return _get_env_bool(name, False)
+
+
+# libmalloc reads these before main() runs, so they cannot be set from inside
+# the current process — the proxy re-execs itself once to apply them. Without
+# them, freed pages from large concurrent request bodies stay resident
+# (``vmmap`` shows whole "MALLOC_LARGE (empty)" regions) and long-lived proxy
+# RSS only ratchets upward (#2820). Vars the operator already set are left
+# untouched; HEADROOM_MALLOC_TUNING=0 disables the re-exec entirely.
+_MALLOC_TUNING = {
+    "MallocAggressiveMadvise": "1",  # madvise freed pages back to the OS eagerly
+    "MallocLargeCache": "0",  # no death-row cache for freed large allocations
+}
+
+
+def _process_is_headroom_cli_entrypoint() -> bool:
+    """Is this process the Headroom CLI itself, rather than an embedder?
+
+    ``_reexec_with_malloc_tuning`` rebuilds the command line as
+    ``python -m headroom.cli <argv[1:]>``. That is only a faithful
+    reconstruction when the process really was started as the Headroom CLI. If
+    something else invoked the ``proxy`` command in-process — pytest's
+    ``CliRunner``, an embedding application, ``runpy`` — then ``argv[1:]``
+    belongs to *that* program, and ``os.execv`` would replace it with a Headroom
+    process parsing arguments that were never meant for us.
+    """
+    argv0 = Path(sys.argv[0] or "")
+    if argv0.name in {"headroom", "headroom.exe"}:
+        return True
+    # `python -m headroom.cli` sets argv[0] to .../headroom/cli/__main__.py.
+    return argv0.parts[-3:] == ("headroom", "cli", "__main__.py")
+
+
+def _reexec_with_malloc_tuning() -> None:
+    if sys.platform != "darwin":
+        return
+    if not _get_env_bool("HEADROOM_MALLOC_TUNING", True):
+        return
+    if os.environ.get("_HEADROOM_MALLOC_TUNED") == "1":
+        return
+    if not _process_is_headroom_cli_entrypoint():
+        return
+    missing = {k: v for k, v in _MALLOC_TUNING.items() if k not in os.environ}
+    # Set the loop guard before the re-exec so the replacement process (which
+    # inherits this environment) skips this path instead of re-execing forever.
+    os.environ["_HEADROOM_MALLOC_TUNED"] = "1"
+    if not missing:
+        return
+    os.environ.update(missing)
+    os.execv(sys.executable, [sys.executable, "-m", "headroom.cli", *sys.argv[1:]])
 
 
 def _get_env_int_optional(name: str) -> int | None:
@@ -1071,6 +1121,7 @@ def proxy(
     Usage with OpenAI-compatible clients:
         OPENAI_BASE_URL=http://localhost:8787/v1 your-app
     """
+    _reexec_with_malloc_tuning()
     ensure_proxy_dependencies()
 
     # Import here to avoid slow startup
@@ -1269,6 +1320,10 @@ def proxy(
         rate_limit_requests_per_minute=rpm if rpm is not None else 60,
         rate_limit_tokens_per_minute=tpm if tpm is not None else 100_000,
         compress_user_messages=_get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
+        periodic_malloc_trim_enabled=_get_env_bool(
+            "HEADROOM_MALLOC_TRIM", sys.platform == "darwin"
+        ),
+        malloc_trim_interval_seconds=_get_env_int("HEADROOM_MALLOC_TRIM_INTERVAL_SECONDS", 60),
         min_tokens_to_crush=_get_env_int("HEADROOM_MIN_TOKENS", 500),
         max_items_after_crush=_get_env_int("HEADROOM_MAX_ITEMS", 50),
         exclude_tools=_parse_exclude_tools(None) or None,

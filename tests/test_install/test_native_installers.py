@@ -224,6 +224,11 @@ def _build_env(home: Path, tmp_path: Path) -> dict[str, str]:
     env["PATH"] = str(shim_dir) + os.pathsep + env.get("PATH", "")
     env["FAKE_DOCKER_STATE"] = str(tmp_path / "fake-docker-state.json")
     env["FAKE_DOCKER_LOG"] = str(tmp_path / "fake-docker.log")
+    # #2970: the PowerShell installer's Ensure-PathEntry persists to the 'User'
+    # PATH scope (HKCU\Environment), which a HOME/USERPROFILE override does not
+    # redirect. Keep the PATH update ephemeral (Process scope) so running these
+    # tests never leaks the throwaway shim dir into the developer's real PATH.
+    env["HEADROOM_INSTALL_PATH_SCOPE"] = "Process"
     return env
 
 
@@ -553,6 +558,125 @@ def test_bash_native_installer_supports_persistent_docker_lifecycle(tmp_path: Pa
 
 def _powershell_executable() -> str | None:
     return shutil.which("pwsh") or shutil.which("powershell") or shutil.which("powershell.exe")
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or _powershell_executable() is None,
+    reason="Windows PowerShell coverage runs on Windows hosts only",
+)
+def test_powershell_installer_does_not_leak_into_user_path(tmp_path: Path) -> None:
+    """The installer must not mutate the real HKCU User PATH (#2970).
+
+    ``Ensure-PathEntry`` persists to the 'User' scope, which a HOME/USERPROFILE
+    override does not redirect, so running the installer against a throwaway home
+    used to leak the temp shim dir into the developer's real PATH. ``_build_env``
+    now sets ``HEADROOM_INSTALL_PATH_SCOPE=Process`` to keep the update
+    ephemeral; the real User PATH must be unchanged across the run.
+    """
+    powershell = _powershell_executable()
+    assert powershell is not None
+
+    count_cmd = [
+        powershell,
+        "-NoProfile",
+        "-Command",
+        "([Environment]::GetEnvironmentVariable('Path','User') -split ';').Count",
+    ]
+    before = _run(count_cmd, env=os.environ.copy()).stdout.strip()
+
+    home = tmp_path / "home"
+    (home / ".local").mkdir(parents=True)
+    env = _build_env(home, tmp_path)
+    env["HEADROOM_DOCKER_IMAGE"] = "headroom:test-image"
+    _run(
+        [
+            powershell,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(REPO_ROOT / "scripts" / "install.ps1"),
+        ],
+        env=env,
+        cwd=REPO_ROOT,
+    )
+
+    after = _run(count_cmd, env=os.environ.copy()).stdout.strip()
+    assert after == before, f"installer leaked into the real User PATH: {before} -> {after}"
+
+
+# AST-extract Ensure-PathEntry from install.ps1 and invoke it in isolation under
+# a given HEADROOM_INSTALL_PATH_SCOPE, so the scope allow-list is exercised
+# without running the whole installer. Parsing via the PowerShell AST (not a
+# regex) keeps this pinned to the real function body. Only 'Process' (ephemeral)
+# and the throwing paths are driven — never 'User', which would mutate the real
+# HKCU PATH.
+_ENSURE_PATH_SCOPE_HARNESS = r"""
+param([string]$InstallScript, [string]$ScopeValue)
+$ErrorActionPreference = 'Stop'
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    $InstallScript, [ref]$null, [ref]$null)
+$fn = $ast.FindAll({
+    param($n)
+    $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $n.Name -eq 'Ensure-PathEntry'
+}, $true) | Select-Object -First 1
+if (-not $fn) { Write-Output 'NOFUNC'; exit 3 }
+Invoke-Expression $fn.Extent.Text
+$env:HEADROOM_INSTALL_PATH_SCOPE = $ScopeValue
+try {
+    Ensure-PathEntry -PathEntry 'C:\headroom-scope-test-marker'
+    Write-Output 'OK'
+} catch {
+    Write-Output ('ERR:' + $_.Exception.Message)
+}
+"""
+
+
+def _invoke_scope_harness(scope_value: str, tmp_path: Path) -> str:
+    powershell = _powershell_executable()
+    assert powershell is not None
+    harness = tmp_path / "scope_harness.ps1"
+    harness.write_text(_ENSURE_PATH_SCOPE_HARNESS, encoding="utf-8")
+    result = _run(
+        [
+            powershell,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(harness),
+            "-InstallScript",
+            str(REPO_ROOT / "scripts" / "install.ps1"),
+            "-ScopeValue",
+            scope_value,
+        ],
+        env=os.environ.copy(),
+        check=False,
+    )
+    return result.stdout.strip()
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or _powershell_executable() is None,
+    reason="Windows PowerShell coverage runs on Windows hosts only",
+)
+def test_path_scope_accepts_process_case_insensitively(tmp_path: Path) -> None:
+    """'Process' (any case) is a supported ephemeral target: Ensure-PathEntry runs."""
+    assert _invoke_scope_harness("process", tmp_path).endswith("OK")
+    assert _invoke_scope_harness("Process", tmp_path).endswith("OK")
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or _powershell_executable() is None,
+    reason="Windows PowerShell coverage runs on Windows hosts only",
+)
+def test_path_scope_rejects_machine_and_invalid_values(tmp_path: Path) -> None:
+    """'Machine' (system-wide) and typos must fail early, before any PATH write."""
+    for bad in ("Machine", "machine", "system", "bogus"):
+        out = _invoke_scope_harness(bad, tmp_path)
+        assert out.startswith("ERR:"), f"scope {bad!r} was not rejected: {out!r}"
+        assert "User" in out and "Process" in out, out
 
 
 @pytest.mark.skipif(

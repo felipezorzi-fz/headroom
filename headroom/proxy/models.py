@@ -7,6 +7,7 @@ Extracted from server.py to keep the codebase maintainable.
 from __future__ import annotations
 
 import logging
+import sys
 from dataclasses import InitVar, dataclass, field
 from datetime import datetime
 from typing import Any, Literal
@@ -439,6 +440,17 @@ class ProxyConfig:
     # causes avoidable memory pressure on their platform.
     # Env: HEADROOM_PERIODIC_TOIN_STATS=0.
     periodic_toin_stats_enabled: bool = True
+
+    # Periodic allocator trim. Long-lived proxies processing large concurrent
+    # request bodies ratchet RSS through freed-but-retained allocator pages;
+    # this returns them to the OS (malloc_zone_pressure_relief on macOS,
+    # malloc_trim on glibc). Default-on only on macOS, where the retained-page
+    # ratchet is the documented failure (#2820); an opt-in elsewhere via
+    # HEADROOM_MALLOC_TRIM=1 so glibc deployments do not silently take on a
+    # once-a-minute allocator purge they did not ask for. Envs:
+    # HEADROOM_MALLOC_TRIM=0/1, HEADROOM_MALLOC_TRIM_INTERVAL_SECONDS.
+    periodic_malloc_trim_enabled: bool = field(default_factory=lambda: sys.platform == "darwin")
+    malloc_trim_interval_seconds: int = 60
 
     # Stateless mode — disable all filesystem writes for read-only / container deployments
     stateless: bool = False
