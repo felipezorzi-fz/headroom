@@ -4,8 +4,13 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.33.x (latest) | :white_check_mark: |
-| < 0.33.x | :x:              |
+| Latest release on PyPI | :white_check_mark: |
+| Any earlier release | :x:              |
+
+Headroom releases frequently and only the most recent release is supported. Security
+fixes ship in a new release rather than being backported to earlier ones, so upgrading is
+the remediation path. Check what you are running with `headroom --version`, and compare it
+against [the current release](https://pypi.org/project/headroom-ai/).
 
 ## Reporting a Vulnerability
 
