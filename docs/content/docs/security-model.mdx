@@ -55,12 +55,69 @@ and both the memory store and the Copilot token can be relocated independently. 
 | Install ID | `<config dir>/install_id` | Random UUID identifying the install to the beacon | Until deleted | No | `0600`, best-effort |
 | Savings tracker | `<workspace>/proxy_savings.json` | Aggregate token/cost counters — no prompt content | Until deleted | No | Inherits umask |
 | License cache | `<workspace>/license_cache.json` | Cached license envelope | Per envelope | No | Inherits umask |
+| Settings store | `<workspace>/settings.json`, or `$HEADROOM_SETTINGS_PATH` | Dashboard-managed knob values — **including two header maps that carry credentials**, see [The settings store](#the-settings-store) | Until deleted | No | `0600`, inherited from `mkstemp` |
+| Proxy log | `<workspace>/logs/proxy.log` + 5 rotations | INFO-level operational log, always on; carries the admin audit stream | 10 MB × 5 backups, then rotated out | No | Inherits umask |
+| Request log | Opt-in, `--log-file` / `$HEADROOM_LOG_FILE` | JSONL per-request records; **full request and response content** when `--log-messages` is on | Until deleted | No | Inherits umask |
 
 The config directory is `$HEADROOM_CONFIG_DIR`, else `$HEADROOM_WORKSPACE_DIR/config`,
 else `~/.headroom/config`.
 
 **Nothing Headroom writes is encrypted at rest.** Confidentiality of everything above
 rests on filesystem permissions and on the security of the account the proxy runs as.
+
+### The settings store
+
+The dashboard settings GUI persists a curated set of 59 knobs to
+`<workspace>/settings.json`. Two of them are marked secret, and both are credential-shaped:
+`ANTHROPIC_TARGET_API_HEADERS` and `OPENAI_TARGET_API_HEADERS` are free-form JSON header
+maps merged into forwarded requests — the field's own help text gives
+`{"Api-Key": "..."}` as the example. Anything you put there is written to disk in
+plaintext. The GUI masks them on read (`GET /settings` returns a sentinel, not the
+value), but that is a display control, not an at-rest one.
+
+Two further properties matter for policy:
+
+- **It is a second way environment knobs get set.** `settings_store.apply_to_environ` runs
+  at CLI startup and again when the app is constructed, using `os.environ.setdefault`. The
+  precedence is `shell export > settings.json > code default`, so a stored value silently
+  becomes the effective configuration on any host where the operator assumed the
+  environment was the only input.
+- **The file is `0600` by construction, not by assertion.** `save()` writes atomically via
+  `tempfile.mkstemp` + `os.replace`, and inherits mkstemp's `0600`. There is no explicit
+  `chmod`, so treat the permission as a property of the current implementation rather than
+  a guarantee.
+
+`HEADROOM_TLS_STRICT`, `HEADROOM_BEACON`, `HEADROOM_CCR_BACKEND`, and `HEADROOM_OFFLINE`
+are **not** in the registry — none of them can be set from this file or the routes that
+write it.
+
+### Logs
+
+Two log paths, with very different sensitivity:
+
+- **`<workspace>/logs/proxy.log` — always on.** A `RotatingFileHandler` (10 MB, 5 backups)
+  is attached to the `headroom` logger when the app is created; there is no flag to
+  suppress it, and it is written before configuration is otherwise applied. It carries
+  INFO-level operational records, and — because the audit logger is a child of `headroom`
+  and writes no file of its own — the structured admin audit stream lands here too. Audit
+  events record the action, method, path, source IP, and status code of `/admin/*`,
+  `/cache/clear`, and `/stats/reset` calls.
+
+  Note the permission asymmetry: unlike `copilot_auth.json`, `ccr_store.db`, and
+  `settings.json`, this file gets no explicit mode. Under a common `0002` umask it lands
+  at `0664` — readable by every account on the host.
+- **The request log — opt-in, and content-bearing when you ask for it.** `--log-file`
+  (`$HEADROOM_LOG_FILE`) writes one JSON object per request. By default those objects hold
+  metadata only. `--log-messages` (`$HEADROOM_LOG_MESSAGES`) adds full request and response
+  message content to the same file *and* serves it on the live feed endpoint. Its own help
+  text warns that it may log sensitive data; on this page's terms, it writes your prompts
+  and completions to disk unencrypted, for as long as you keep the file.
+
+Both `HEADROOM_LOG_FILE` and `HEADROOM_LOG_MESSAGES` are in the settings registry, which
+means full message logging can be switched on — and its destination chosen — from the
+settings surface described under
+[Local control surfaces](#local-control-surfaces). `--stateless` suppresses the request
+log entirely (`log_file` is forced to `None`); it does not suppress `proxy.log`.
 
 ### Memory store paths
 
@@ -118,8 +175,9 @@ memory only.
 
 ## Local control surfaces
 
-The proxy exposes HTTP routes beyond the provider-shaped ones. All of the sensitive
-routes — `/admin/*`, `/debug/*`, `/stats/reset`, and the content-bearing `/v1/retrieve*`
+The proxy exposes HTTP routes beyond the provider-shaped ones. The sensitive ones —
+`/admin/*`, `/debug/*`, `/cache/clear`, `/stats/reset`, `/settings*`, `/transformations/feed`,
+`/v1/feedback*`, `/v1/telemetry*`, `/v1/toin/*`, and the content-bearing `/v1/retrieve*`
 family — are guarded by `require_loopback`, which enforces two independent conditions:
 
 1. The client address must be a loopback IP.
@@ -130,6 +188,31 @@ attacker-controlled hostname to `127.0.0.1` so the browser connects locally whil
 page origin stays remote. The IP check alone passes in that scenario; the `Host:` check
 does not. Guarded routes return **404**, not 403, so they are indistinguishable from
 absent routes to a scanner.
+
+A third gate, `require_same_origin`, sits on the mutating routes (`/admin/runtime-env`,
+`/cache/clear`, `/stats/reset`, `/settings`, `/settings/apply`). It defends a different
+attack: a plain CSRF, where a remote page's script posts a "simple" request straight at
+`http://127.0.0.1:<port>`. Both loopback gates pass in that case — the browser really is
+connecting to loopback and really does send a loopback `Host:` — but the `Origin:` header
+still names the attacker's page, and that is what this gate rejects. Requests with no
+`Origin` at all (CLI tools, curl) pass, which is the intended behaviour for a
+locally-driven surface.
+
+### The two CIDR allowlists
+
+Two environment variables can extend this beyond loopback. Both default to empty, so the
+default posture is the one described above — but an operator who sets either has changed
+the boundary and should say so in their own threat model.
+
+| Variable | Effect |
+|---|---|
+| `HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS` | Peers in these CIDRs reach `/settings`, `/settings/schema`, `/dashboard/settings`, and the settings *writes* **without being on loopback** — and additionally see the fields `/stats` and `/stats-lifetime` otherwise withhold from network callers (per-request ids, providers, models, errors, project names, backend config). Added so the settings UI works behind a reverse proxy. |
+| `HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS` | Peers in these CIDRs are trusted to supply `X-Forwarded-*` headers, which is what makes the client IP the *forwarded* one rather than the gateway's. |
+
+Both parse strictly: a malformed CIDR raises at startup rather than silently emptying the
+allowlist. Note the interaction — trusting a gateway for `X-Forwarded-For` means the
+dashboard CIDR check is applied to a client-supplied header, so the two must be configured
+together and pointed at infrastructure you control.
 
 ### What `POST /admin/runtime-env` can change
 
@@ -147,20 +230,52 @@ accept arbitrary environment variables — writes are restricted to a hardcoded 
 | `HEADROOM_OUTPUT_HOLDOUT` | Output-shaping holdout fraction |
 | `HEADROOM_INTERCEPT_READ_MIN_CHARS` | ast-grep read-interception threshold |
 
-Keys outside this list are ignored. Two properties follow, and both are deliberate:
+Keys outside this list are ignored, and `/admin/upstream` is read-only — there is no
+write route on the admin surface, specifically so a caller cannot redirect
+credential-bearing traffic through it.
 
-- **The upstream URL cannot be changed over HTTP.** `/admin/upstream` is read-only.
-  There is no write route, specifically so that a local process cannot redirect
-  credential-bearing traffic to an arbitrary destination through this surface.
-- **TLS verification cannot be changed over HTTP.** `HEADROOM_TLS_STRICT` is not in the
-  allowlist and is read only from the process environment at startup.
+### What `POST /settings` can change
+
+The settings routes are the wider surface, and they should be read as part of the same
+threat model as `/admin/*` rather than as a separate UI concern. `POST /settings`
+validates against the 59-field registry described under
+[The settings store](#the-settings-store) and writes the result to disk;
+`POST /settings/apply` does the same and then **restarts the proxy** so the values take
+effect (self-restarting on service deployments, returning the host command under Docker).
+
+That combination has consequences worth stating plainly:
+
+- **The upstream URL *can* be changed through this surface.** `ANTHROPIC_TARGET_API_URL`
+  and `OPENAI_TARGET_API_URL` are in the registry. `/admin/upstream` remains read-only,
+  but a caller who reaches `/settings` can still repoint credential-bearing traffic at a
+  destination of their choosing and restart the proxy to apply it. If you are relying on
+  the admin surface being read-only, this is the path that gets around it.
+- **Full message logging can be switched on.** `HEADROOM_LOG_MESSAGES` and
+  `HEADROOM_LOG_FILE` are both in the registry, so the same caller can start writing your
+  prompts and completions to a file path they choose.
+- **Credential-shaped values can be written.** The two `*_TARGET_API_HEADERS` maps are
+  stored here in plaintext.
+
+What is *not* reachable, verified against both the runtime-env allowlist and the settings
+registry: `HEADROOM_TLS_STRICT`, `HEADROOM_BEACON`, `HEADROOM_CCR_BACKEND`, and
+`HEADROOM_OFFLINE`. TLS verification in particular cannot be relaxed over HTTP; it is read
+from the process environment at startup only.
+
+All of these calls are audited. `/admin/*`, `/cache/clear`, and `/stats/reset` emit a
+structured event carrying action, method, path, source IP, and status; `/admin/runtime-env`,
+`POST /settings`, and `POST /settings/apply` add their own with the *changed keys* — keys
+only, deliberately, so a secret's value never reaches the log. The audit stream is a
+logger, not a file of its own, so in a default install it lands in
+`<workspace>/logs/proxy.log`.
 
 ### Residual risk
 
-The loopback gate is an effective boundary against remote and browser-based attackers.
-It is not a boundary against local ones. Any process that can bind a loopback socket as
-your user can flip the seven knobs above, read `/v1/retrieve*`, and reach the debug
-routes. There is no token, no mTLS, and no per-caller authorization.
+The loopback and same-origin gates are an effective boundary against remote and
+browser-based attackers. They are not a boundary against local ones. Any process that can
+bind a loopback socket as your user can flip the seven runtime knobs, write the 59
+settings and restart the proxy to apply them, read `/v1/retrieve*`, and reach the debug
+routes. There is no token, no mTLS, and no per-caller authorization — the guards
+distinguish *where a request came from*, not *who sent it*.
 
 For single-user developer machines — the intended deployment — this is proportionate.
 For shared build boxes, multi-user jump hosts, or anywhere untrusted local code runs,
@@ -186,12 +301,24 @@ its own treatment. It is governed by `HEADROOM_BEACON` and is **opt-out**
 `workers.dev` address.
 
 **Payload class: counters and identifiers, no content.** Each report is a cumulative
-snapshot carrying a random session id and sequence number, duration and turn counts,
-token counters (original, attempted, input, output, saved, cache read/write), derived
-ratios, and per-category transform/skip tallies. Alongside it go resource attributes: a
-random per-install UUID, Headroom version, OS type, CPU architecture, and — when known —
-install mode and detected stack. Provider and model names are included.
+snapshot — not a delta — carrying:
 
+- **Session**: a random id, a sequence number, duration, turn count, and whether this is
+  the final report for the session.
+- **Tokens**: original, attempted, input, output, saved, tool-saved, cache read/write, and
+  uncached counts, plus derived percentages (saved, eligible, yield, all-layers variants,
+  cache-read, latency overhead).
+- **Compression**: transform and skip tallies keyed by transform slug, a per-strategy
+  breakdown (`strategy`, event count, tokens in, tokens out), aggregate and per-turn
+  latency/overhead in milliseconds, passthrough turns, and response-cache hits.
+- **Context**: request sources (`proxy` / `mcp`), the sorted provider and model names seen,
+  a failure count, and those failures split by HTTP status code.
+
+Alongside each report go resource attributes: a random per-install UUID, Headroom version,
+OS type, CPU architecture, and — when known — install mode and detected stack.
+
+The keys in the tally dictionaries are internal slugs, not free text: transform names are
+truncated at the first colon before being counted, and sources are one of two literals.
 Prompts, completions, file contents, tool results, and file paths are **not** in the
 payload. The install id is a random UUID rather than a machine fingerprint, and resets
 if you delete `<config dir>/install_id`.
@@ -234,6 +361,13 @@ at once where fully-offline operation is acceptable.
 Two further environment variables are worth an explicit policy decision.
 (`HEADROOM_BEACON` is the third, covered under [The beacon](#the-beacon-is-on-by-default).)
 
+A note on where "the environment" comes from: `settings.json` is applied to the process
+environment at startup with `setdefault`, so for any knob in the settings registry the
+effective value may come from that file rather than from your shell. None of the three
+knobs in this section are in that registry, but a fleet policy asserted purely by
+inspecting exported environment variables is incomplete for the ones that are — see
+[The settings store](#the-settings-store).
+
 **`HEADROOM_TLS_STRICT=0`** relaxes certificate validation so Headroom can operate
 behind a corporate TLS-inspecting proxy. It is narrowly scoped — it clears only the
 RFC 5280 strict flag and does not disable verification wholesale — but it is still a
@@ -243,8 +377,8 @@ See the README for details on scope and platform behavior.
 **`HEADROOM_UPDATE_CHECK=off`** disables the daily PyPI version check. Recommended for
 managed fleets, where upgrades should be driven by your own release process.
 
-Neither is reachable through the admin endpoint; both are read from the process
-environment.
+Neither is reachable through the admin endpoint or the settings routes; both are read
+from the process environment only.
 
 ## What `wrap` changes on your machine
 
