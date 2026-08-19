@@ -2142,7 +2142,7 @@ def _retire_user_scope_serena(registrar: Any) -> None:
     for user scope explicitly.
     """
     from headroom.mcp_registry.claude import SCOPE_LOCAL, SCOPE_USER
-    from headroom.mcp_registry.ledger import headroom_installed_matching
+    from headroom.mcp_registry.ledger import clear_install, headroom_installed_matching
 
     if getattr(registrar, "scope", None) != SCOPE_LOCAL:
         return
@@ -2153,6 +2153,11 @@ def _retire_user_scope_serena(registrar: Any) -> None:
     if not headroom_installed_matching(registrar.name, global_entry):
         return
     if registrar.unregister_server("serena", scope=SCOPE_USER):
+        # Clear the legacy ledger record along with the config entry it
+        # authorized — otherwise its fingerprint outlives the migration and
+        # can later be mistaken for proof that Headroom owns a same-named
+        # entry the user installs globally themselves.
+        clear_install(registrar.name, "serena")
         click.echo(
             "  Serena MCP: removed the machine-wide entry an earlier wrap installed "
             "(it now loads only in this project)"
@@ -2173,6 +2178,11 @@ def _remove_headroom_installed_serena_mcp(registrar: Any) -> str:
         for scope in (SCOPE_LOCAL, SCOPE_USER):
             current = registrar.get_server("serena", scope=scope)
             ownership_key = registrar.ownership_key("serena", scope=scope)
+            if current is None:
+                # Nothing left to protect — an ownership record must not
+                # outlive the entry it authorized.
+                clear_install(registrar.name, "serena", ownership_key=ownership_key)
+                continue
             if not headroom_installed_matching(
                 registrar.name, current, ownership_key=ownership_key
             ):

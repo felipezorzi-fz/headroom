@@ -134,6 +134,66 @@ def test_rewrap_retires_a_stale_global_entry(
     assert "removed the machine-wide entry" in capsys.readouterr().out
 
 
+def test_rewrap_migration_clears_the_ledger_so_a_reinstall_is_never_deleted(
+    tmp_path: Path,
+) -> None:
+    """The migration must retire its own ownership claim, not just the entry.
+
+    If the ledger record survived, a user who later installs the *same*
+    Serena command globally themselves would collide with the old
+    fingerprint, and a subsequent wrap would mistake their entry for one
+    Headroom still owns and delete it out from under them.
+    """
+    from headroom.mcp_registry.ledger import headroom_installed_matching
+
+    old_spec = build_serena_spec("claude-code")
+    _seed_global_serena(tmp_path, old_spec)
+    record_install("claude", old_spec)
+
+    (tmp_path / ".claude").mkdir(exist_ok=True)
+    project_a = tmp_path / "project-a"
+    project_a.mkdir()
+    registrar_a = ClaudeRegistrar(
+        claude_cli=None, home_dir=tmp_path, scope=SCOPE_LOCAL, project_dir=project_a
+    )
+    wrap_cli._setup_serena_mcp(registrar_a, context="claude-code")
+
+    # The migration removed the config entry - the ownership record backing
+    # it must be gone too, not just the entry it pointed at.
+    assert not headroom_installed_matching("claude", old_spec)
+
+    # The user reinstalls the identical command globally themselves.
+    _seed_global_serena(tmp_path, old_spec)
+
+    project_b = tmp_path / "project-b"
+    project_b.mkdir()
+    registrar_b = ClaudeRegistrar(
+        claude_cli=None, home_dir=tmp_path, scope=SCOPE_LOCAL, project_dir=project_b
+    )
+    wrap_cli._setup_serena_mcp(registrar_b, context="claude-code")
+
+    assert _config(tmp_path)["mcpServers"]["serena"]["command"] == old_spec.command
+
+
+def test_remove_serena_clears_a_stale_ownership_record_with_no_live_entry(
+    tmp_path: Path,
+) -> None:
+    """An ownership record must not outlive the config entry it authorized."""
+    from headroom.mcp_registry.ledger import headroom_installed_matching
+
+    registrar = _registrar(tmp_path)
+    ownership_key = registrar.ownership_key("serena", scope=SCOPE_LOCAL)
+    stale_spec = ServerSpec(name="serena", command="uvx", args=("start-mcp-server",))
+    record_install("claude", stale_spec, ownership_key=ownership_key)
+    # Deliberately no live entry: simulates one removed by another path
+    # (e.g. the user's own agent config edit) without going through us.
+
+    status = wrap_cli._remove_headroom_installed_serena_mcp(registrar)
+
+    assert status == "not_headroom_owned"
+    assert not headroom_installed_matching("claude", stale_spec, ownership_key=ownership_key)
+
+
 def test_rewrap_leaves_a_user_managed_global_entry_alone(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
