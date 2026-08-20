@@ -107,6 +107,12 @@ headroom dashboard                      # live savings dashboard (proxy must be 
 
 To use headroom, it is recommended you launch a wrapped agent session each time so that all necessary setup is completed. When wrapping a coding agent, headroom starts a local proxy, installs **Serena** for semantic code navigation, and launches a coding agent session configured to proxy requests through headroom.
 
+`headroom wrap ...` is session-scoped: its proxy exits with the wrapped agent.
+For a proxy that survives reboots, use the turnkey `headroom deploy` command.
+Use `headroom install apply` when you need to choose a specific persistent
+service, scheduled task, Docker runtime, scope, or provider target; see the
+[persistent installs guide](https://headroom-docs.vercel.app/docs/persistent-installs).
+
 Serena is registered at **user scope** (for Claude Code, in `~/.claude.json`), so it stays available in your other projects until you run `headroom unwrap`. To skip it entirely, wrap with `--code-memory none`.
 
 The `headroom` CLI ships **only** via the PyPI package. The npm `headroom-ai` is the TypeScript SDK — a library you import (`import { compress } from 'headroom-ai'`), not a CLI, so it provides no `headroom` command.
