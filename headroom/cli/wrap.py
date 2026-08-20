@@ -7519,7 +7519,9 @@ def dsh(
 
     from headroom.mcp_registry import DshRegistrar
 
-    _setup_coding_compressor(DshRegistrar(), serena_context="agent", verbose=verbose)
+    registrar = DshRegistrar()
+    registrar.ensure_home()
+    _setup_coding_compressor(registrar, serena_context="agent", verbose=verbose)
 
     _launch_tool(
         binary=argv[0],

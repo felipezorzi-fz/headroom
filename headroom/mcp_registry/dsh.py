@@ -175,6 +175,16 @@ class DshRegistrar(MCPRegistrar):
     def detect(self) -> bool:
         return _dsh_home().exists()
 
+    def ensure_home(self) -> None:
+        """Create the dsh config home if missing (explicit wrap path only).
+
+        ``headroom wrap dsh`` targets a harness that is about to launch, so it
+        must register before dsh creates its own home on first boot. Global
+        ``headroom mcp install`` detection stays conservative: ``detect()``
+        still requires an existing home.
+        """
+        _dsh_home().mkdir(parents=True, exist_ok=True)
+
     def get_server(self, server_name: str) -> ServerSpec | None:
         managed = _read_managed_block(self._config_file)
         if managed.entries is None:

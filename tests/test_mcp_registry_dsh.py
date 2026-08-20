@@ -34,6 +34,31 @@ def test_not_detected_without_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     assert DshRegistrar().detect() is False
 
 
+def test_ensure_home_creates_missing_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    home = tmp_path / "dsh"
+    monkeypatch.setenv("DSH_HOME", str(home))
+    reg = DshRegistrar()
+    assert reg.detect() is False
+    reg.ensure_home()
+    assert reg.detect() is True
+    assert home.is_dir()
+
+
+def test_register_after_ensure_home_without_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Fresh install: no DSH home yet — the explicit wrap path must be able to
+    register before dsh creates its home on first boot."""
+    home = tmp_path / "dsh"
+    monkeypatch.setenv("DSH_HOME", str(home))
+    reg = DshRegistrar()
+    reg.ensure_home()
+    result = reg.register_server(_spec())
+    assert result.status is RegisterStatus.REGISTERED
+    text = (home / "cordis.patch.yml").read_text(encoding="utf-8")
+    assert "@deepseek-ai/dsh-mcp-client" in text
+
+
 def test_register_writes_patch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     home = tmp_path / "dsh"
     home.mkdir()
