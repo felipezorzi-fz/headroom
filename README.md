@@ -134,14 +134,7 @@ args = ["mcp", "serve"]
 
 ## Proof
 
-**Savings on real agent workloads:**
-
-| Workload                      | Before | After  | Savings |
-|-------------------------------|-------:|-------:|--------:|
-| Code search (100 results)     | 17,765 |  1,408 | **92%** |
-| SRE incident debugging        | 65,694 |  5,118 | **92%** |
-| GitHub issue triage           | 54,174 | 14,761 | **73%** |
-| Codebase exploration          | 78,502 | 41,254 | **47%** |
+See the [benchmark methodology and reproduction instructions](https://headroom-docs.vercel.app/docs/benchmarks), including Compression Performance.
 
 **Accuracy preserved on standard benchmarks:**
 

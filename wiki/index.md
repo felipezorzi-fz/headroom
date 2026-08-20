@@ -288,15 +288,6 @@ Context management is handled automatically inside the pipeline (live-zone-only 
 
 **87.6% fewer tokens. Same answer.** The FATAL error was automatically preserved — not by keyword matching, but by statistical analysis of field variance.
 
-### Real Workloads
-
-| Scenario | Before | After | Savings |
-|----------|--------|-------|---------|
-| Code search (100 results) | 17,765 | 1,408 | **92%** |
-| SRE incident debugging | 65,694 | 5,118 | **92%** |
-| Codebase exploration | 78,502 | 41,254 | **47%** |
-| GitHub issue triage | 54,174 | 14,761 | **73%** |
-
 ### Accuracy Benchmarks
 
 | Benchmark | Category | N | Accuracy | Compression |
