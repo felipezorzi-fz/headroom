@@ -339,27 +339,37 @@ def test_no_native_tls_in_wheel_build_tree() -> None:
     import subprocess
 
     for crate in ("headroom-py", "headroom-proxy", "headroom-core"):
-        result = subprocess.run(
-            [
-                "cargo",
-                "tree",
-                "--target",
-                "x86_64-unknown-linux-gnu",
-                "-p",
-                crate,
-                "-i",
-                "native-tls",
-            ],
-            cwd=str(ROOT),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        not_in_tree = result.returncode != 0 and "did not match any packages" in result.stderr
-        assert not_in_tree, (
+        try:
+            result = subprocess.run(
+                [
+                    "cargo",
+                    "tree",
+                    "--target",
+                    "x86_64-unknown-linux-gnu",
+                    "-p",
+                    crate,
+                    "-i",
+                    "native-tls",
+                ],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            pytest.skip("cargo is unavailable in this environment")
+        output = result.stderr + result.stdout
+        if result.returncode != 0 and "did not match any packages" in output:
+            continue
+        if result.returncode != 0:
+            pytest.fail(
+                f"could not inspect {crate}'s Linux dependency tree:\n"
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+            )
+        pytest.fail(
             f"native-tls is back in {crate}'s build tree — likely some "
             f"crate's `default-features = true` re-enabled native-tls "
-            f"transitively:\n{result.stdout}"
+            f"transitively:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
 
 
