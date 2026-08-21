@@ -160,6 +160,7 @@ from headroom.proxy.modes import (
 from headroom.proxy.probe_recorder import probe_recorder_from_env
 from headroom.proxy.project_context import (
     classify_project,
+    set_current_cwd,
     set_current_project,
     strip_project_path_prefix,
 )
@@ -2519,6 +2520,7 @@ class WebSocketProjectPrefixMiddleware:
                 name.decode("latin-1"): value.decode("latin-1") for name, value in scope["headers"]
             }
             set_current_project(classify_project(headers) or prefix_project)
+            # No set_current_cwd() here -- HTTP-only for now, see project_context.py.
         await self.app(scope, receive, send)
 
 
@@ -3262,6 +3264,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         query = request.url.query
         headers = dict(request.headers.items())
         set_current_project(classify_project(headers) or prefix_project)
+        set_current_cwd(headers.get("x-headroom-cwd"))
         # Path-based Codex identification: stamp X-Client: codex on the
         # Responses endpoint for callers that don't otherwise classify (e.g.
         # Codex Desktop, whose User-Agent isn't a known codex UA). Without it

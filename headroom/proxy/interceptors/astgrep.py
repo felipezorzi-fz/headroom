@@ -17,12 +17,14 @@ import re
 import shutil
 import subprocess
 import tempfile
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
 from headroom import binaries
 from headroom._subprocess import run
 from headroom.proxy import runtime_env
+from headroom.proxy.project_context import get_current_cwd
 
 from . import base
 
@@ -108,6 +110,63 @@ def _detect_truncation(source: str) -> tuple[int, int] | None:
     return int(m.group("end_line")), int(m.group("total_lines"))
 
 
+class ReadVerificationResult(Enum):
+    """Client-independent fallback for `_detect_truncation`'s banner regex:
+    compares tool_output against the real file on disk instead of parsing
+    client-specific prose. Only used when the banner regex finds nothing."""
+
+    COMPLETE = "complete"
+    TRUNCATED = "truncated"
+    # Unresolvable path, unreadable file, or mismatched content — never guess.
+    UNKNOWN = "unknown"
+
+
+def _verify_truncation_on_disk_enabled() -> bool:
+    # Live read (not a module constant), matching _min_chars_to_rewrite()'s
+    # hot-reload behavior.
+    return runtime_env.getenv("HEADROOM_VERIFY_TRUNCATION_ON_DISK", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _verify_read_against_disk(
+    file_path: str | None,
+    received_content: str,
+    cwd: str | None,
+) -> tuple[ReadVerificationResult, tuple[int, int] | None]:
+    """Compare `received_content` against the real file at `file_path`.
+
+    `cwd` (the `x-headroom-cwd` header) resolves a relative `file_path`.
+    TRUNCATED requires an exact-prefix match with strictly more on disk —
+    a weaker match means the file diverged since the client read it, not
+    a provable truncation, so it's UNKNOWN. Returns `(visible_lines,
+    total_lines)` alongside TRUNCATED so the header can cite real numbers
+    without a second, potentially racy, read.
+    """
+    if not file_path:
+        return ReadVerificationResult.UNKNOWN, None
+    if os.path.isabs(file_path):
+        resolved = file_path
+    elif cwd:
+        resolved = os.path.join(cwd, file_path)
+    else:
+        return ReadVerificationResult.UNKNOWN, None
+    try:
+        disk_content = Path(resolved).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        logger.debug("disk verification: cannot read %s: %s", resolved, e)
+        return ReadVerificationResult.UNKNOWN, None
+    if disk_content == received_content:
+        return ReadVerificationResult.COMPLETE, None
+    if disk_content.startswith(received_content) and len(disk_content) > len(received_content):
+        visible_lines = len(received_content.splitlines())
+        total_lines = len(disk_content.splitlines())
+        return ReadVerificationResult.TRUNCATED, (visible_lines, total_lines)
+    return ReadVerificationResult.UNKNOWN, None
+
+
 class AstGrepReadOutline:
     """Interceptor that outlines verbose code-file Read outputs."""
 
@@ -150,7 +209,14 @@ class AstGrepReadOutline:
         if not matches:
             return None
 
+        # Banner (cheap, no I/O) wins; disk verification is the opt-in fallback.
         truncation = _detect_truncation(tool_output)
+        if truncation is None and _verify_truncation_on_disk_enabled():
+            verdict, disk_truncation = _verify_read_against_disk(
+                _path_from_input(tool_input), tool_output, get_current_cwd()
+            )
+            if verdict is ReadVerificationResult.TRUNCATED:
+                truncation = disk_truncation
         outline = _build_outline(matches, tool_output, truncation)
         return outline if outline else None
 

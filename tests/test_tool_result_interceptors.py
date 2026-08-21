@@ -14,8 +14,13 @@ from headroom.proxy.interceptors import (
     interceptor_failure_counts,
     register,
 )
-from headroom.proxy.interceptors.astgrep import AstGrepReadOutline
+from headroom.proxy.interceptors.astgrep import (
+    AstGrepReadOutline,
+    ReadVerificationResult,
+    _verify_read_against_disk,
+)
 from headroom.proxy.interceptors.base import reset_interceptor_failure_counts
+from headroom.proxy.project_context import get_current_cwd, set_current_cwd
 from headroom.tokenizer import Tokenizer
 
 
@@ -276,6 +281,194 @@ def test_astgrep_flags_truncated_read_wording_variants(tokenizer):
     assert len(result.spans) == 1
     new_content = result.messages[1]["content"][0]["content"]
     assert "truncated upstream" in new_content
+    assert "showing through line 42 of 90 total" in new_content
+
+
+# -------- Disk verification: client-independent truncation fallback ----- #
+
+
+def test_set_get_current_cwd_round_trips():
+    set_current_cwd("  /repo/project  ")
+    try:
+        assert get_current_cwd() == "/repo/project"
+    finally:
+        set_current_cwd(None)
+
+
+def test_set_current_cwd_none_and_blank_both_clear():
+    set_current_cwd("/repo")
+    try:
+        assert get_current_cwd() == "/repo"
+        set_current_cwd("   ")
+        assert get_current_cwd() is None
+    finally:
+        set_current_cwd(None)
+
+
+class TestVerifyReadAgainstDisk:
+    def test_missing_file_path_is_unknown(self):
+        verdict, info = _verify_read_against_disk(None, "abc", "/repo")
+        assert verdict is ReadVerificationResult.UNKNOWN
+        assert info is None
+
+    def test_relative_path_without_cwd_is_unknown(self):
+        verdict, info = _verify_read_against_disk("payments.py", "abc", None)
+        assert verdict is ReadVerificationResult.UNKNOWN
+        assert info is None
+
+    def test_unreadable_file_is_unknown(self, tmp_path):
+        verdict, info = _verify_read_against_disk(str(tmp_path / "missing.py"), "abc", None)
+        assert verdict is ReadVerificationResult.UNKNOWN
+        assert info is None
+
+    def test_exact_match_is_complete(self, tmp_path):
+        f = tmp_path / "payments.py"
+        f.write_text(_PY_FIXTURE, encoding="utf-8")
+        verdict, info = _verify_read_against_disk(str(f), _PY_FIXTURE, None)
+        assert verdict is ReadVerificationResult.COMPLETE
+        assert info is None
+
+    def test_strict_prefix_is_truncated(self, tmp_path):
+        f = tmp_path / "payments.py"
+        f.write_text(_PY_FIXTURE, encoding="utf-8")
+        partial = _PY_FIXTURE[:200]
+        verdict, info = _verify_read_against_disk(str(f), partial, None)
+        assert verdict is ReadVerificationResult.TRUNCATED
+        assert info == (len(partial.splitlines()), len(_PY_FIXTURE.splitlines()))
+
+    def test_relative_path_resolves_against_cwd(self, tmp_path):
+        f = tmp_path / "payments.py"
+        f.write_text(_PY_FIXTURE, encoding="utf-8")
+        partial = _PY_FIXTURE[:200]
+        verdict, info = _verify_read_against_disk("payments.py", partial, str(tmp_path))
+        assert verdict is ReadVerificationResult.TRUNCATED
+        assert info is not None
+
+    def test_content_mismatch_is_unknown_not_truncated(self, tmp_path):
+        # File diverged since the client read it -- not a clean prefix.
+        f = tmp_path / "payments.py"
+        f.write_text(_PY_FIXTURE.replace("compute_subtotal", "compute_total"), encoding="utf-8")
+        verdict, info = _verify_read_against_disk(str(f), _PY_FIXTURE, None)
+        assert verdict is ReadVerificationResult.UNKNOWN
+        assert info is None
+
+
+def test_astgrep_disk_verification_flags_truncation_when_no_banner(
+    tokenizer, tmp_path, monkeypatch
+):
+    """Opted in, cwd bound, file on disk is strictly longer than the tool_result,
+    and no banner is present -- disk verification alone should qualify the header."""
+    monkeypatch.setenv("HEADROOM_VERIFY_TRUNCATION_ON_DISK", "1")
+    monkeypatch.setenv("HEADROOM_INTERCEPT_READ_MIN_CHARS", "50")
+    f = tmp_path / "payments.py"
+    f.write_text(_PY_FIXTURE, encoding="utf-8")
+    # Split after most functions -- a too-short partial's elision markers
+    # can outweigh tiny bodies and trip the "refuse to enlarge" guard.
+    marker = "\n\ndef format_receipt"
+    partial = _PY_FIXTURE[: _PY_FIXTURE.index(marker)]  # no banner text anywhere
+    assert "truncated" not in partial.lower()
+
+    set_current_cwd(str(tmp_path))
+    try:
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "abc",
+                        "name": "Read",
+                        "input": {"file_path": "payments.py"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "abc", "content": partial}],
+            },
+        ]
+        result = apply_to_messages(messages, tokenizer)
+    finally:
+        set_current_cwd(None)
+
+    assert len(result.spans) == 1
+    new_content = result.messages[1]["content"][0]["content"]
+    assert "truncated upstream" in new_content
+    visible_lines = len(partial.splitlines())
+    total_lines = len(_PY_FIXTURE.splitlines())
+    assert f"showing through line {visible_lines} of {total_lines} total" in new_content
+    assert "def compute_subtotal" in new_content
+    assert "def apply_promo" in new_content
+    # Beyond the truncation point -- never reached ast-grep, can't appear.
+    assert "def format_receipt" not in new_content
+
+
+def test_astgrep_disk_verification_disabled_by_default(tokenizer, tmp_path, monkeypatch):
+    """Same truncated-on-disk scenario as above, but without the opt-in env
+    var -- must behave exactly like the no-signal case (no header change)."""
+    monkeypatch.delenv("HEADROOM_VERIFY_TRUNCATION_ON_DISK", raising=False)
+    monkeypatch.setenv("HEADROOM_INTERCEPT_READ_MIN_CHARS", "50")
+    f = tmp_path / "payments.py"
+    f.write_text(_PY_FIXTURE, encoding="utf-8")
+    marker = "\n\ndef format_receipt"
+    partial = _PY_FIXTURE[: _PY_FIXTURE.index(marker)]
+
+    set_current_cwd(str(tmp_path))
+    try:
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "abc",
+                        "name": "Read",
+                        "input": {"file_path": "payments.py"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "abc", "content": partial}],
+            },
+        ]
+        result = apply_to_messages(messages, tokenizer)
+    finally:
+        set_current_cwd(None)
+
+    new_content = result.messages[1]["content"][0]["content"]
+    assert "truncated upstream" not in new_content
+
+
+def test_astgrep_banner_detection_takes_priority_over_disk_verification(tokenizer, monkeypatch):
+    """When a banner is already present, disk verification must not run at
+    all (no cwd bound here -- if it ran, resolution would fail anyway), and
+    the banner's own numbers must be what the header reports."""
+    monkeypatch.setenv("HEADROOM_VERIFY_TRUNCATION_ON_DISK", "1")
+    truncated_source = (
+        _PY_FIXTURE + "\n\n[Truncated: PARTIAL view — /repo/payments.py: "
+        "showing lines 1-42 of 90 total (26031 tokens, cap 25000). "
+        "Call Read with offset=43 to see more.]\n"
+    )
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "abc",
+                    "name": "Read",
+                    "input": {"file_path": "/repo/payments.py"},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "abc", "content": truncated_source}],
+        },
+    ]
+    result = apply_to_messages(messages, tokenizer)
+    new_content = result.messages[1]["content"][0]["content"]
     assert "showing through line 42 of 90 total" in new_content
 
 
