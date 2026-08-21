@@ -49,7 +49,8 @@ FAIL = "fail"
 SKIP = "skip"
 
 _LOOPBACK_URL_RE = re.compile(r"https?://(?:127\.0\.0\.1|localhost):(\d+)")
-_CODEX_BASE_URL_RE = re.compile(r'base_url\s*=\s*"https?://(?:127\.0\.0\.1|localhost):(\d+)')
+_CODEX_BASE_URL_RE = re.compile(r'(?m)^[ \t]*base_url\s*=\s*"([^"\r\n]+)"')
+_CODEX_MODEL_PROVIDER_RE = re.compile(r'(?m)^[ \t]*model_provider\s*=\s*"([^"\r\n]+)"')
 
 # Ollama's fixed default port. `ollama launch claude` writes
 # ``ANTHROPIC_BASE_URL=http://127.0.0.1:11434`` into the launched Claude Code
@@ -373,9 +374,10 @@ def check_wrap_marker_staleness(settings_path: Path) -> CheckResult:
 def check_codex_routing(config_path: Path, port: int) -> CheckResult:
     """Is Codex configured to route through the proxy?
 
-    Detection keys on the ``[model_providers.headroom]`` section, which both
-    writers emit (install's persistent block and wrap's auto-injected block).
-    Substring matching keeps malformed TOML a WARN instead of a crash.
+    Detection prefers the active ``model_provider`` section's loopback
+    ``base_url``, while retaining the ``[model_providers.headroom]`` fallback
+    emitted by persistent and wrap installs. Best-effort matching keeps
+    malformed TOML a WARN instead of a crash.
     """
     name = "codex"
     if not config_path.exists():
@@ -389,22 +391,32 @@ def check_codex_routing(config_path: Path, port: int) -> CheckResult:
         text = config_path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return CheckResult(name=name, status=WARN, summary=f"could not read {config_path}: {exc}")
-    if "[model_providers.headroom]" not in text:
-        return CheckResult(
-            name=name,
-            status=WARN,
-            summary="not routed (no Headroom provider in config.toml)",
-            hint="wrap it: headroom wrap codex",
-        )
-    match = _CODEX_BASE_URL_RE.search(text)
-    if match and int(match.group(1)) != port:
-        return CheckResult(
-            name=name,
-            status=WARN,
-            summary=f"routed to port {match.group(1)}, but doctor probed port {port}",
-            hint=f"re-run with: headroom doctor --port {match.group(1)}",
-        )
-    return CheckResult(name=name, status=PASS, summary=f"routed ({config_path})")
+    active_match = _CODEX_MODEL_PROVIDER_RE.search(text)
+    provider_id = active_match.group(1) if active_match else "headroom"
+    base_url = _codex_provider_base_url(text, provider_id)
+    if base_url is not None:
+        return _classify_routing_url(name, base_url, port, source=str(config_path))
+    return CheckResult(
+        name=name,
+        status=WARN,
+        summary="not routed (no Headroom provider in config.toml)",
+        hint="wrap it: headroom wrap codex",
+    )
+
+
+def _codex_provider_base_url(text: str, provider_id: str) -> str | None:
+    section_match = re.search(
+        rf"(?m)^[ \t]*\[model_providers\.{re.escape(provider_id)}\][ \t]*(?:#.*)?$",
+        text,
+    )
+    if section_match is None:
+        return None
+    section = text[section_match.end() :]
+    next_section = re.search(r"(?m)^[ \t]*\[", section)
+    if next_section is not None:
+        section = section[: next_section.start()]
+    base_url_match = _CODEX_BASE_URL_RE.search(section)
+    return base_url_match.group(1) if base_url_match else None
 
 
 def check_shell_env(environ: Mapping[str, str], port: int) -> CheckResult:
