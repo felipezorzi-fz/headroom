@@ -374,6 +374,297 @@ def test_ensure_proxy_restarts_ephemeral_proxy_for_openai_api_url_mismatch(monke
     assert calls[1][2]["openai_api_url"] == "https://api.individual.githubcopilot.com"
 
 
+def test_proxy_routing_mismatches_detects_backend_and_urls(monkeypatch) -> None:
+    monkeypatch.delenv("HEADROOM_BACKEND", raising=False)
+    check = wrap_cli._proxy_routing_mismatches
+
+    # Stock proxy vs stock request: compatible.
+    assert check({"backend": "anthropic"}, backend=None) == []
+    # Running non-default backend vs default request: mismatch.
+    assert check({"backend": "anyllm"}, backend=None) == ["backend"]
+    # Requested backend vs different running backend: mismatch.
+    assert check({"backend": "anthropic"}, backend="anyllm") == ["backend"]
+    # HEADROOM_BACKEND env feeds the effective requested backend.
+    monkeypatch.setenv("HEADROOM_BACKEND", "anyllm")
+    assert check({"backend": "anyllm"}, backend=None) == []
+    monkeypatch.delenv("HEADROOM_BACKEND")
+
+    # Running proxy carries an upstream the caller never requested (the
+    # 2026-08-22 incident: a wrap-auggie proxy reused by wrap codex).
+    assert check(
+        {"backend": "anthropic", "augment_api_url": "https://xlb.api.augmentcode.com"},
+        backend=None,
+    ) == ["augment_api_url"]
+    # Requested upstream the running proxy does not have: mismatch.
+    assert check(
+        {"backend": "anthropic"},
+        backend=None,
+        requested_api_urls={"openai_api_url": "https://api.githubcopilot.com"},
+    ) == ["openai_api_url"]
+    # Same upstream on both sides, modulo normalization noise: compatible.
+    assert (
+        check(
+            {"backend": "anthropic", "openai_api_url": "https://api.githubcopilot.com/v1/"},
+            backend=None,
+            requested_api_urls={"openai_api_url": "https://api.githubcopilot.com"},
+        )
+        == []
+    )
+    # Missing backend key (older proxy): treated as unknown, not a mismatch.
+    assert check({"openai_api_url": None}, backend=None) == []
+
+
+def test_ensure_proxy_restarts_idle_proxy_for_routing_mismatch(monkeypatch) -> None:
+    """A clientless proxy with captive routing (augment upstream) is restarted."""
+    calls: list[object] = []
+    health = {
+        "version": wrap_cli._HEADROOM_VERSION,
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        "config": {
+            "pid": "12345",
+            "memory": False,
+            "learn": False,
+            "code_graph": False,
+            "backend": "anthropic",
+            "augment_api_url": "https://xlb.api.augmentcode.com",
+        },
+    }
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: len(calls) == 0)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(wrap_cli, "_live_proxy_clients", lambda *a, **kw: [])
+    monkeypatch.setattr(wrap_cli, "_port_bind_error", lambda port: None)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_kill_proxy_by_pid",
+        lambda pid, port: calls.append(("kill", pid, port)) or True,
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: calls.append(("start", args, kwargs)),
+    )
+
+    proc, actual_port = wrap_cli._ensure_proxy(8787, False)
+
+    assert proc is None
+    assert actual_port == 8787
+    assert calls[0] == ("kill", 12345, 8787)
+    assert calls[1][0] == "start"
+
+
+def test_ensure_proxy_bumps_port_for_routing_mismatch_with_attached_clients(
+    monkeypatch,
+) -> None:
+    """With live clients attached, an incompatible proxy is neither reused
+    nor restarted: the wrap starts a dedicated proxy on a free port."""
+    calls: list[object] = []
+    health = {
+        "version": wrap_cli._HEADROOM_VERSION,
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        "config": {
+            "pid": "12345",
+            "backend": "anthropic",
+            "augment_api_url": "https://xlb.api.augmentcode.com",
+        },
+    }
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: port == 8787)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(wrap_cli, "_live_proxy_clients", lambda *a, **kw: [999])
+    monkeypatch.setattr(
+        wrap_cli,
+        "_find_available_port",
+        lambda start_port, **kw: calls.append(("find_port", start_port)) or 8799,
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_kill_proxy_by_pid",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("incompatible proxy with live clients must not be killed")
+        ),
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: calls.append(("start", args, kwargs)),
+    )
+
+    proc, actual_port = wrap_cli._ensure_proxy(8787, False)
+
+    assert proc is None
+    assert actual_port == 8799
+    assert calls[0] == ("find_port", 8787)
+    assert calls[1][0] == "start"
+    assert calls[1][1][0] == 8799
+
+
+def test_ensure_proxy_reuses_proxy_with_matching_routing_config(monkeypatch) -> None:
+    """Happy path: identical routing config reuses the running proxy."""
+    health = {
+        "version": wrap_cli._HEADROOM_VERSION,
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        "config": {
+            "pid": "12345",
+            "memory": False,
+            "learn": False,
+            "code_graph": False,
+            "backend": "anthropic",
+            "openai_api_url": None,
+        },
+    }
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_kill_proxy_by_pid",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not kill")),
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not start")),
+    )
+
+    proc, actual_port = wrap_cli._ensure_proxy(8787, False)
+
+    assert proc is None
+    assert actual_port == 8787
+
+
+def test_ensure_proxy_restarts_idle_proxy_for_backend_mismatch(monkeypatch) -> None:
+    calls: list[object] = []
+    health = {
+        "version": wrap_cli._HEADROOM_VERSION,
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        "config": {"pid": "12345", "backend": "anyllm"},
+    }
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: len(calls) == 0)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(wrap_cli, "_live_proxy_clients", lambda *a, **kw: [])
+    monkeypatch.setattr(wrap_cli, "_port_bind_error", lambda port: None)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_kill_proxy_by_pid",
+        lambda pid, port: calls.append(("kill", pid, port)) or True,
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: calls.append(("start", args, kwargs)),
+    )
+
+    proc, actual_port = wrap_cli._ensure_proxy(8787, False)
+
+    assert proc is None
+    assert actual_port == 8787
+    assert calls[0] == ("kill", 12345, 8787)
+    assert calls[1][0] == "start"
+
+
+def test_ensure_proxy_never_reuses_configless_proxy(monkeypatch) -> None:
+    """A proxy exposing no config block cannot be compatibility-checked; it
+    must not be silently reused (the persistent branch already treats
+    config-unavailable as fall-through). No PID is known, so the wrap starts
+    a dedicated proxy on a free port instead of killing blindly."""
+    calls: list[object] = []
+    health = {
+        "version": wrap_cli._HEADROOM_VERSION,
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+    }
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: port == 8787)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_config", lambda port: None)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_find_available_port",
+        lambda start_port, **kw: calls.append(("find_port", start_port)) or 8799,
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_kill_proxy_by_pid",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("configless proxy exposes no PID; must not kill")
+        ),
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: calls.append(("start", args, kwargs)),
+    )
+
+    proc, actual_port = wrap_cli._ensure_proxy(8787, False)
+
+    assert proc is None
+    assert actual_port == 8799
+    assert calls[0] == ("find_port", 8787)
+    assert calls[1][0] == "start"
+
+
+def test_ensure_proxy_routing_mismatch_on_persistent_deployment_uses_dedicated_port(
+    monkeypatch,
+) -> None:
+    """A persistent deployment's routing comes from its manifest; a wrap with
+    different routing must not reuse it AND must not let the ephemeral path
+    kill it (the manifest would point at a hijacked port). The wrap starts a
+    dedicated proxy on a free port and the deployment keeps running."""
+    calls: list[object] = []
+    health = {
+        "version": wrap_cli._HEADROOM_VERSION,
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        "config": {
+            "pid": "12345",
+            "backend": "anthropic",
+            "augment_api_url": "https://xlb.api.augmentcode.com",
+        },
+    }
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: _Manifest())
+    monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: True)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: port == 8787)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_find_available_port",
+        lambda start_port, **kw: calls.append(("find_port", start_port)) or 8799,
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_restart_persistent_proxy",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("routing mismatch must not restart the deployment")
+        ),
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_kill_proxy_by_pid",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("routing mismatch must not kill the deployment's proxy")
+        ),
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: calls.append(("start", args, kwargs)),
+    )
+
+    proc, actual_port = wrap_cli._ensure_proxy(8787, False)
+
+    assert proc is None
+    assert actual_port == 8799
+    assert calls[0] == ("find_port", 8787)
+    assert calls[1][0] == "start"
+    assert calls[1][1][0] == 8799
+
+
 def test_ensure_proxy_starts_isolated_ephemeral_proxy_for_copilot_subscription_seed(
     monkeypatch,
 ) -> None:
@@ -741,8 +1032,14 @@ def test_ensure_proxy_restarts_for_flags_when_no_other_wrapper(monkeypatch) -> N
     assert calls[1][0] == "start"
 
 
-def test_ensure_proxy_restarts_persistent_deployment_for_feature_mismatch(monkeypatch) -> None:
-    """Persistent deployment should restart when requested features differ from running config."""
+def test_ensure_proxy_diverts_persistent_deployment_for_routing_mismatch(
+    monkeypatch,
+) -> None:
+    """A routing-URL mismatch against a persistent deployment starts a
+    dedicated proxy on a free port. Killing the deployment's proxy and
+    starting an ephemeral one with the requested routing (the old behavior)
+    orphaned the manifest: it still pointed at the port while the routing it
+    declares no longer matched what served it."""
     calls: list[object] = []
     health = {
         "version": wrap_cli._HEADROOM_VERSION,
@@ -761,11 +1058,17 @@ def test_ensure_proxy_restarts_persistent_deployment_for_feature_mismatch(monkey
     monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
     # Persistent proxy is running, so _check_proxy returns True
     monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
-    monkeypatch.setattr(wrap_cli, "_port_bind_error", lambda port: None)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_find_available_port",
+        lambda start_port, **kw: calls.append(("find_port", start_port)) or 8799,
+    )
     monkeypatch.setattr(
         wrap_cli,
         "_kill_proxy_by_pid",
-        lambda pid, port: calls.append(("kill", pid, port)) or True,
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("routing mismatch must not kill the deployment's proxy")
+        ),
     )
     monkeypatch.setattr(
         wrap_cli,
@@ -781,10 +1084,12 @@ def test_ensure_proxy_restarts_persistent_deployment_for_feature_mismatch(monkey
     )
 
     assert proc is None
-    assert actual_port == 8787
-    # Proxy should be killed and restarted due to openai_api_url mismatch
-    assert calls[0] == ("kill", 12345, 8787)
+    assert actual_port == 8799
+    # Deployment left running; dedicated proxy started on the free port with
+    # the requested routing.
+    assert calls[0] == ("find_port", 8787)
     assert calls[1][0] == "start"
+    assert calls[1][1][0] == 8799
     assert calls[1][2]["openai_api_url"] == "https://api.githubcopilot.com"
 
 
