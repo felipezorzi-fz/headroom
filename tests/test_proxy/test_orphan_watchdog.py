@@ -9,8 +9,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from fastapi.testclient import TestClient
 
+import headroom.proxy.server as server
 from headroom.proxy import orphan_watchdog as ow
+from headroom.proxy.server import ProxyConfig
 
 
 def _write_marker(clients_dir: Path, pid: int, **extra: object) -> Path:
@@ -219,3 +222,88 @@ class TestWatchdogLoop:
         )
 
         assert stopped == [True]
+
+
+class TestDefensiveHelpers:
+    def test_non_dict_marker_json_is_not_recycling_proof(self, tmp_path) -> None:
+        # Valid JSON but not an object: only a dict record can prove recycling.
+        marker = _write_marker(tmp_path, os.getpid())
+        marker.write_text("[1, 2]", encoding="utf-8")
+        assert ow._marker_pid_recycled(marker, os.getpid()) is False
+
+    def test_unlink_oserror_is_tolerated(self, tmp_path, monkeypatch) -> None:
+        dead_pid = 2**31 - 1  # never alive
+        marker = _write_marker(tmp_path, dead_pid)
+        real_unlink = Path.unlink
+
+        def flaky_unlink(self: Path, *args: object, **kwargs: object) -> None:
+            if self == marker:
+                raise OSError("simulated EPERM")
+            real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", flaky_unlink)
+        # The scan tolerates the failed prune and still reports no live clients.
+        assert ow.live_client_pids(tmp_path) == []
+        assert marker.exists()
+
+    def test_active_session_count_swallows_registry_errors(self) -> None:
+        def boom() -> int:
+            raise RuntimeError("registry exploded")
+
+        proxy = SimpleNamespace(ws_sessions=SimpleNamespace(active_count=boom))
+        assert ow._active_session_count(proxy) == 0
+
+    def test_default_stop_raises_sigterm(self, monkeypatch) -> None:
+        sent: list[int] = []
+        monkeypatch.setattr(ow.signal, "raise_signal", lambda sig: sent.append(sig))
+        ow._default_stop()
+        assert sent == [ow.signal.SIGTERM]
+
+
+class TestServerWiring:
+    """create_app must start the watchdog only for wrap-spawned single-worker
+    proxies, and cancel it cleanly on shutdown."""
+
+    @staticmethod
+    def _config() -> ProxyConfig:
+        return ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+        )
+
+    @staticmethod
+    async def _fake_loop(*args: object, **kwargs: object) -> None:
+        await asyncio.sleep(3600)
+
+    def test_starts_and_stops_watchdog_when_wrap_owned(self, monkeypatch) -> None:
+        monkeypatch.setenv(ow.WRAP_OWNED_ENV, "1")
+        monkeypatch.delenv(server._MULTI_WORKER_CONFIG_ENV, raising=False)
+        monkeypatch.setattr(server, "orphan_watchdog_loop", self._fake_loop)
+
+        app = server.create_app(self._config())
+        with TestClient(app) as client:
+            task = client.app.state.orphan_watchdog_task
+            assert task is not None
+            assert not task.done()
+        # Lifespan teardown cancelled it and cleared the state slot.
+        assert app.state.orphan_watchdog_task is None
+
+    def test_skips_watchdog_for_multi_worker(self, monkeypatch) -> None:
+        monkeypatch.setenv(ow.WRAP_OWNED_ENV, "1")
+        monkeypatch.setenv(server._MULTI_WORKER_CONFIG_ENV, "{}")
+        monkeypatch.setattr(server, "orphan_watchdog_loop", self._fake_loop)
+
+        app = server.create_app(self._config())
+        with TestClient(app) as client:
+            assert client.app.state.orphan_watchdog_task is None
+
+    def test_skips_watchdog_when_not_wrap_owned(self, monkeypatch) -> None:
+        monkeypatch.delenv(ow.WRAP_OWNED_ENV, raising=False)
+        monkeypatch.delenv(server._MULTI_WORKER_CONFIG_ENV, raising=False)
+        monkeypatch.setattr(server, "orphan_watchdog_loop", self._fake_loop)
+
+        app = server.create_app(self._config())
+        with TestClient(app) as client:
+            assert client.app.state.orphan_watchdog_task is None
