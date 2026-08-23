@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
+
 from headroom.proxy.output_savings import (
     BaselineModel,
     SavingsLedger,
@@ -350,6 +354,44 @@ class TestLedgerPersistence:
         p.write_text("{not json")
         ledger = SavingsLedger.load(p)
         assert ledger.baseline.total_samples == 0
+
+    def test_failed_save_leaves_the_previous_ledger_intact(self, tmp_path, monkeypatch):
+        """A write that dies mid-flight must not cost the user their baseline.
+
+        Both failure paths are patched so this test describes the requirement
+        rather than one implementation: an in-place ``write_text`` truncates
+        first and loses everything, while the temp-file-plus-rename path leaves
+        the original untouched.
+        """
+        path = tmp_path / "savings.json"
+        ledger = SavingsLedger()
+        ledger.baseline.observe("opus|a|s|tools", 1000)
+        ledger.record("treatment", "opus|a|s|tools", 800)
+        ledger.save(path)
+        before = path.read_bytes()
+        assert before, "precondition: a ledger exists on disk"
+
+        def truncate_then_die(self, *_args, **_kwargs):
+            # What open(path, "w") does before the first byte is written.
+            Path(self).write_bytes(b"")
+            raise OSError(28, "No space left on device")
+
+        def die(*_args, **_kwargs):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(Path, "write_text", truncate_then_die)
+        monkeypatch.setattr("headroom.fsutil.os.replace", die)
+
+        doomed = SavingsLedger()
+        doomed.baseline.observe("opus|a|s|tools", 2000)
+        with pytest.raises(OSError):
+            doomed.save(path)
+
+        assert path.read_bytes() == before, "the previous ledger survived"
+        monkeypatch.undo()
+        assert SavingsLedger.load(path).baseline.total_samples == 1
+        # And no temp file left behind for the next reader to trip over.
+        assert [f.name for f in tmp_path.iterdir()] == ["savings.json"]
 
 
 # ---------------------------------------------------------------------------

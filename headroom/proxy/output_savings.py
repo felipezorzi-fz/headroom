@@ -326,11 +326,26 @@ class SavingsLedger:
         return ledger
 
     def save(self, path: Any) -> None:
+        """Persist the ledger, atomically.
+
+        ``Path.write_text`` truncates the file to zero bytes before writing the
+        new content, so a crash, SIGKILL or ENOSPC mid-write leaves a truncated
+        document that ``load`` discards -- taking the baseline and every
+        accumulated observation with it. The recorder rewrites this file every
+        ``flush_every`` requests on a busy proxy, and readers (``estimate``,
+        ``_reload_baseline_locked``, out-of-process consumers of the ledger)
+        can be part-way through a read at that moment. ``fsutil.write_text``
+        writes a temp file in the same directory and ``os.replace``s it in, so
+        both crashes and concurrent readers see either the old ledger or the
+        complete new one.
+        """
         from pathlib import Path
+
+        from ..fsutil import write_text
 
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(self.to_dict(), separators=(",", ":")))
+        write_text(p, json.dumps(self.to_dict(), separators=(",", ":")))
 
     @classmethod
     def load(cls, path: Any) -> SavingsLedger:
