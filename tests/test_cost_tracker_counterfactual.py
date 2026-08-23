@@ -49,6 +49,45 @@ def test_savings_at_list_price():
     assert abs(stats["savings_usd"] - expected) < 0.001
 
 
+def test_openai_cache_write_not_double_charged():
+    """OpenAI has no cache-write premium, so cache_write tokens (which equal the
+    uncached tokens for OpenAI: input - cache_read) must not be billed a second
+    time on top of uncached input. Regression for the ~2x cost over-report in
+    stats() where _get_cache_prices defaulted the write price to the full input
+    rate for a read-discount provider.
+    """
+    import litellm
+
+    from headroom.pricing.litellm_pricing import resolve_litellm_model
+    from headroom.proxy.server import CostTracker
+
+    model = "gpt-4o"
+    info = litellm.model_cost.get(resolve_litellm_model(model), {})
+    uncached_price = info.get("input_cost_per_token")
+    cache_read_price = info.get("cache_read_input_token_cost", uncached_price)
+    # The exact shape that triggered the bug: cache reads priced, creation not.
+    assert info.get("cache_creation_input_token_cost") is None
+
+    ct = CostTracker()
+    input_tokens, cache_read = 100_000, 20_000
+    non_cached = input_tokens - cache_read  # what the OpenAI handler reports for BOTH
+    ct.record_tokens(
+        model,
+        tokens_saved=0,
+        tokens_sent=input_tokens,
+        cache_read_tokens=cache_read,
+        cache_write_tokens=non_cached,
+        uncached_tokens=non_cached,
+    )
+    stats = ct.stats()
+
+    # Correct: cached at the read discount + uncached at full, NO write charge.
+    expected = cache_read * cache_read_price + non_cached * uncached_price
+    doubled = expected + non_cached * uncached_price  # the buggy figure
+    assert abs(stats["cost_with_headroom_usd"] - expected) < 0.001
+    assert stats["cost_with_headroom_usd"] < doubled - 0.001
+
+
 def test_savings_monotonic():
     """Adding more saved tokens always increases savings_usd."""
     from headroom.proxy.server import CostTracker

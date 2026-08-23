@@ -1068,8 +1068,24 @@ class CostTracker:
             uncached = info.get("input_cost_per_token")
             if not uncached:
                 return None
-            cache_read = info.get("cache_read_input_token_cost", uncached)
-            cache_write = info.get("cache_creation_input_token_cost", uncached)
+            cc_cost = info.get("cache_creation_input_token_cost")
+            cr_cost = info.get("cache_read_input_token_cost")
+            cache_read = cr_cost if cr_cost is not None else uncached
+            # Cache-write price. A provider that prices cache READS but not cache
+            # CREATION (OpenAI-family) uses a read-discount model with NO write
+            # premium: the written tokens are already billed once as uncached
+            # input, and the OpenAI handler reports cache_write == uncached for
+            # them, so pricing a separate cache_write at the full input rate
+            # double-charges the non-cached input (~2x for a low-hit request).
+            # Treat writes as free there. Anthropic prices cache_creation
+            # explicitly (Sonnet/Opus), so it is unaffected; a model with no
+            # cache pricing at all (e.g. Haiku here) keeps the full-price default.
+            if cc_cost is not None:
+                cache_write = cc_cost
+            elif cr_cost is not None:
+                cache_write = 0.0
+            else:
+                cache_write = uncached
             return (cache_read, cache_write, uncached)
         except Exception:
             return None
