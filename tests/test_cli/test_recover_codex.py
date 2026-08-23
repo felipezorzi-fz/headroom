@@ -18,6 +18,28 @@ from headroom.cli.main import main
 from headroom.providers.codex.recovery import discover_dangling_homes, recover_codex_home
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits only")
+def test_write_private_text_is_born_private(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The backup manifest must be *created* 0o600, not narrowed after.
+
+    Neutralize every chmod and force a permissive umask so the mode reflects
+    only how the file was created: born-private ``os.open(..., 0o600)`` yields
+    0o600, while the old write-then-chmod would leave the umask default 0o644.
+    """
+    monkeypatch.setattr(Path, "chmod", lambda self, mode: None)
+    target = tmp_path / "manifest.json"
+    old_umask = os.umask(0o022)
+    try:
+        codex_recovery._write_private_text(target, '{"ok": true}\n')
+    finally:
+        os.umask(old_umask)
+
+    assert target.read_text(encoding="utf-8") == '{"ok": true}\n'
+    assert (target.stat().st_mode & 0o777) == 0o600
+
+
 def _write_db(path: Path, rows: list[tuple[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path)

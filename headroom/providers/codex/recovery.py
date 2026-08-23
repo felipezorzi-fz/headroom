@@ -404,6 +404,31 @@ def _quote(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
 
 
+def _write_private_text(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` without a world/group-readable window.
+
+    The backup manifest records the recovered account's file layout. Writing via
+    ``write_text`` then ``chmod(0o600)`` creates the file at the umask default
+    (typically ``0o644``) and only narrows it afterward, so a local user can read
+    it in the gap — or permanently, if the process dies between the two calls.
+    ``os.open`` with an explicit ``0o600`` mode makes a *new* file private from
+    birth; an existing file is narrowed first (before new content is written) and
+    again after. Mirrors ``telemetry/session.py``'s install-id write.
+    """
+    try:
+        if path.exists():
+            path.chmod(0o600)
+    except OSError:
+        pass
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
 def _database_schema(connection: sqlite3.Connection, schema: str) -> dict[str, str]:
     rows = connection.execute(
         f"SELECT name, sql FROM {_quote(schema)}.sqlite_master "
@@ -741,8 +766,5 @@ def recover_codex_home(*, source: Path, target: Path) -> RecoveryReport:
     manifest = asdict(report)
     manifest.update(source=str(source), target=str(target), backup_dir=str(backup_dir))
     manifest_file = backup_dir / "manifest.json"
-    manifest_file.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    manifest_file.chmod(0o600)
+    _write_private_text(manifest_file, json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     return report

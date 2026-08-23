@@ -80,7 +80,31 @@ class SQLiteBackend:
         self._last_purge = 0.0
         self._conn = self._open()
 
+    @staticmethod
+    def _ensure_private(path: Path) -> None:
+        """Make the database file 0600 *before* sqlite opens it.
+
+        The originals stored here can contain sensitive tool output (file
+        contents, command output). ``mkdir`` created the parent at the umask
+        default (typically world-traversable ``0o755``), and sqlite would
+        otherwise create the db file itself at the umask default too — leaving it
+        world/group readable in the window before the post-commit ``chmod`` below
+        narrows it (or permanently, if the process dies in that window). Creating
+        the file with an explicit ``0o600`` mode makes a *new* db private from
+        birth; a pre-existing file is narrowed in place. sqlite treats the empty
+        file as a fresh database. Best-effort: on Windows POSIX perms do not
+        apply, so failures are ignored.
+        """
+        try:
+            if path.exists():
+                path.chmod(0o600)
+            else:
+                os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
+        except OSError:
+            pass
+
     def _open(self) -> sqlite3.Connection:
+        self._ensure_private(self._path)
         conn = sqlite3.connect(self._path, check_same_thread=False)
         # Wait for competing writers instead of failing with SQLITE_BUSY —
         # multiple proxy workers share this file, and writes are frequent
