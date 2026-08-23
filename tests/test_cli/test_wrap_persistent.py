@@ -454,6 +454,62 @@ def test_ensure_proxy_restarts_idle_proxy_for_routing_mismatch(monkeypatch) -> N
     assert calls[1][0] == "start"
 
 
+def _routing_mismatch_health(config_overrides: dict) -> dict:
+    """Shared fixture: running proxy with captive augment routing (mismatch)."""
+    config = {
+        "pid": "12345",
+        "memory": False,
+        "learn": False,
+        "code_graph": False,
+        "backend": "anthropic",
+        "augment_api_url": "https://xlb.api.augmentcode.com",
+    }
+    config.update(config_overrides)
+    return {
+        "version": wrap_cli._HEADROOM_VERSION,
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        "config": config,
+    }
+
+
+def test_ensure_proxy_routing_mismatch_without_pid_raises(monkeypatch) -> None:
+    """Incompatible proxy that exposes no PID cannot be restarted: fail loud."""
+    health = _routing_mismatch_health({})
+    del health["config"]["pid"]
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(wrap_cli, "_port_bind_error", lambda port: None)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not start")),
+    )
+
+    with pytest.raises(click.ClickException, match="did not expose a PID"):
+        wrap_cli._ensure_proxy(8787, False)
+
+
+def test_ensure_proxy_routing_mismatch_kill_failure_raises(monkeypatch) -> None:
+    """When the incompatible proxy survives the kill attempt: fail loud."""
+    health = _routing_mismatch_health({})
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(wrap_cli, "_port_bind_error", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_kill_proxy_by_pid", lambda pid, port: False)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not start")),
+    )
+
+    with pytest.raises(click.ClickException, match="Failed to stop incompatible proxy"):
+        wrap_cli._ensure_proxy(8787, False)
+
+
 def test_ensure_proxy_bumps_port_for_routing_mismatch_with_attached_clients(
     monkeypatch,
 ) -> None:
