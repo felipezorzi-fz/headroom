@@ -93,7 +93,10 @@ def split_into_sections(content: str) -> list[ContentSection]:
         line = lines[i]
 
         if match := _CODE_FENCE_PATTERN.match(line):
-            language = match.group(1) or "unknown"
+            # Preserve a bare fence as bare. Using the string ``"unknown"``
+            # here made reassembly rewrite ````` into `````unknown`` even when
+            # the fenced content itself was unchanged.
+            language = match.group(1) or None
             code_lines = []
             start_line = i
             i += 1
