@@ -365,7 +365,7 @@ troubleshooting.
 <summary><b>What's inside</b></summary>
 
 - **SmartCrusher** — universal JSON: arrays of dicts, nested objects, mixed types.
-- **CodeCompressor** — AST-aware for Python, JS/TS, Go, Rust, Java, C/C++, Perl.
+- **CodeCompressor** — AST-aware for Python, JS/TS, Go, Rust, Java, C/C++, C#, PHP.
 - **Kompress-v2-base** — our HuggingFace model, trained on agentic traces.
 - **Image compression** — 40–90% reduction via trained ML router.
 - **CacheAligner** - detects and warns about volatile content that can bust provider KV cache prefixes; never rewrites prompts.
