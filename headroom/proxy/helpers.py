@@ -1602,6 +1602,16 @@ def _strip_internal_headers(headers: dict[str, str]) -> dict[str, str]:
     return strip_internal_headers(headers, mode=get_strip_internal_headers_mode())
 
 
+def strip_openai_internal_headers(headers: dict[str, str]) -> dict[str, str]:
+    """Strip internal x-openai-internal-* headers that cause upstreams to reject requests."""
+    cleaned = dict(headers)
+    for k in list(cleaned.keys()):
+        if k.lower().startswith("x-openai-internal-"):
+            cleaned.pop(k, None)
+    return cleaned
+
+
+
 def merge_extra_headers(
     headers: dict[str, str],
     extra: dict[str, str] | None,

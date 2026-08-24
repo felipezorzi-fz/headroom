@@ -1255,3 +1255,19 @@ def test_handle_streaming_passthrough_client_disconnect():
         )
     )
     assert response.status_code == 204
+
+
+def test_strip_openai_internal_headers():
+    from headroom.proxy.helpers import strip_openai_internal_headers
+    headers = {
+        "Host": "api.openai.com",
+        "X-OpenAI-Internal-Codex-Responses-Lite": "true",
+        "x-openai-internal-another-header": "value",
+        "Authorization": "Bearer key"
+    }
+    cleaned = strip_openai_internal_headers(headers)
+    assert "Host" in cleaned
+    assert "Authorization" in cleaned
+    assert "X-OpenAI-Internal-Codex-Responses-Lite" not in cleaned
+    assert "x-openai-internal-another-header" not in cleaned
+
