@@ -474,6 +474,22 @@ The proxy also shows a one-line "update available" notice on startup. It checks
 PyPI at most once a day, in the background, and never blocks. Opt out with
 `HEADROOM_UPDATE_CHECK=off` (also skipped in `--stateless` mode and CI).
 
+## Uninstall
+
+One command reverses everything Headroom set up — it unwraps each wrapped tool (Codex, Claude, OpenClaw), removes MCP registrations, tears down any persistent supervisor, and stops the local proxy:
+
+```bash
+headroom uninstall                # preview first with: headroom uninstall --dry-run
+headroom uninstall --purge-state  # also delete ~/.headroom (savings history, caches)
+```
+
+Then remove the package with your package manager:
+
+```bash
+pip uninstall headroom-ai
+npm uninstall -g headroom-ai      # if you installed the Node package
+```
+
 ### Corporate / SSL-inspection environments
 
 If `pip install "headroom-ai[all]"` fails with `CERTIFICATE_VERIFY_FAILED`
