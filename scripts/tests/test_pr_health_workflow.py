@@ -30,3 +30,18 @@ def test_merge_state_unknown_does_not_clear_conflict_or_rebase_labels() -> None:
     assert 'elif [[ "$merge_state" != "UNKNOWN" ]]; then' in workflow
     assert 'gh pr edit "$pr" --repo "$REPO" --remove-label "status: needs rebase"' in workflow
     assert 'gh pr edit "$pr" --repo "$REPO" --remove-label "status: has conflicts"' in workflow
+
+
+def test_rebase_label_uses_ref_comparison_instead_of_merge_state() -> None:
+    workflow = Path(".github/workflows/pr-health.yml").read_text(encoding="utf-8")
+
+    assert 'if [[ "$merge_state" == "BEHIND" ]]; then' not in workflow
+    assert 'gh api "repos/$REPO/compare/$base_ref...$head_oid"' in workflow
+    assert "--field drift" in workflow
+    assert 'if [[ "$drift" == "stale" ]]; then' in workflow
+
+
+def test_unknown_drift_does_not_clear_the_rebase_label() -> None:
+    workflow = Path(".github/workflows/pr-health.yml").read_text(encoding="utf-8")
+
+    assert 'elif [[ "$drift" == "current" ]]; then' in workflow
