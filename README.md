@@ -242,6 +242,7 @@ shows an **Output Tokens Saved** card next to input compression, labelled
 | OpenHands    | ✅              | starts proxy + launches          |
 | Mistral Vibe | ✅              | starts proxy + launches          |
 | Oh My Pi     | ✅              | injects config · starts proxy + launches |
+| Pi           | ✅              | transient provider extension; starts proxy + launches |
 | Cortex Code  | Library only    | 60–65% savings (library mode; no `wrap`) |
 | Kimi CLI     | ✅              | OAuth bearer forwarded — log in once |
 | ZCode        | ✅              | starts proxy and prints base URLs for ZCode settings |
