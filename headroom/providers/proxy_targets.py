@@ -14,6 +14,7 @@ from headroom.copilot_auth import (
 from headroom.providers.codex import resolve_codex_routing
 from headroom.providers.codex.endpoints import CHATGPT_BACKEND_API_URL
 from headroom.providers.vertex import vertex_target_for_location as _vertex_target_for_location
+from headroom.proxy.agy_terminator import DEFAULT_ALLOWLIST, normalize_host
 from headroom.proxy.upstream_guard import is_safe_upstream_url
 
 LEGACY_API_TARGET_ATTRS: dict[str, str] = {
@@ -36,6 +37,22 @@ def vertex_target_for_location(proxy: Any, location: str) -> str:
     return _vertex_target_for_location(api_target(proxy, "vertex"), location)
 
 
+def cloudcode_host_base(host: str) -> str | None:
+    """Passthrough base for an allowlisted Cloud Code host, else ``None``.
+
+    agy (Google Antigravity CLI) reaches the proxy via TLS-MITM that terminates
+    the WHOLE connection to the Cloud Code host it addressed, so control-plane
+    calls land on the catch-all rather than a recognized route. Those paths
+    exist only on the Cloud Code host itself; forward them back to it.
+    Membership in ``DEFAULT_ALLOWLIST`` — not a loose suffix match — is the trust
+    boundary: a forged Host such as ``evilcloudcode-pa.googleapis.com`` returns
+    ``None`` (closing the SSRF) so the caller falls back to the configured
+    default.
+    """
+    normalized = normalize_host(host)
+    return f"https://{normalized}" if normalized in DEFAULT_ALLOWLIST else None
+
+
 logger = logging.getLogger("headroom.proxy")
 
 
@@ -43,6 +60,8 @@ def select_passthrough_base_url(
     proxy: Any, headers: Mapping[str, str], path: str | None = None
 ) -> str:
     """Resolve the upstream base URL for catch-all proxy passthrough requests."""
+    if base := cloudcode_host_base(headers.get("host", "")):
+        return base
     routing = resolve_codex_routing(headers)
     if routing.is_chatgpt_auth:
         return CHATGPT_BACKEND_API_URL
