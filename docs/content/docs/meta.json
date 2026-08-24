@@ -41,6 +41,7 @@
     "vscode-copilot",
     "opencode",
     "opencode-deepseek",
+    "auggie",
     "grok-build",
     "mcp",
     "---Configuration---",

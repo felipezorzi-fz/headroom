@@ -297,6 +297,25 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         async def bedrock_invoke_stream(request: Request, model_id: str):
             return await proxy.handle_bedrock_invoke(request, model_id, stream=True)
 
+    # AugmentCode Auggie tenant passthrough. Registered ONLY when an upstream is
+    # configured (`--augment-api-url` / AUGMENT_TARGET_API_URL). Auggie's wire is
+    # Augment-proprietary: `POST /chat-stream` is the inference call, and the rest
+    # (`/get-models`, `/agents/list-remote-tools`, `/settings/get-mcp-*-configs`,
+    # `/find-missing`, ...) fall through to the catch-all, which
+    # `select_passthrough_base_url` points at the same upstream. `/chat-stream`
+    # gets an explicit route only so its telemetry is tagged `augment` (the one
+    # call that spends tokens); the body is forwarded verbatim (the proprietary
+    # shape is not compressed in v1) and the Augment session credential passes
+    # through untouched. The upstream is an explicit argument (not read from a
+    # client-controllable header), so there is no routing-header spoofing vector.
+    augment_api_url = getattr(proxy.config, "augment_api_url", None)
+    if augment_api_url:
+        _augment_base = augment_api_url.rstrip("/")
+
+        @app.post("/chat-stream")
+        async def augment_chat_stream(request: Request):
+            return await proxy.handle_passthrough(request, _augment_base, "chat-stream", "augment")
+
     _register_openai_responses_routes(app, proxy)
 
     _register_provider_handler_routes(app, proxy)

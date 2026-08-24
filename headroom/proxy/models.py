@@ -169,6 +169,16 @@ class ProxyConfig:
     # SigV4 signature. Leave unset (default) to keep `--backend bedrock`'s
     # direct-to-AWS, re-signing behavior unchanged.
     bedrock_api_url: str | None = None
+    # Custom upstream for the AugmentCode Auggie passthrough. When set, the proxy
+    # forwards every Auggie tenant path verbatim to this base (the inference call
+    # `POST /chat-stream` plus `/get-models`, `/agents/list-remote-tools`,
+    # `/settings/get-mcp-*-configs`, `/find-missing`, ...), tagging the
+    # `/chat-stream` call telemetry as the `augment` provider. `headroom wrap
+    # auggie` points Auggie here by rewriting the session `tenantURL`, so Auggie's
+    # subscription traffic (all models, including Prism routing) is observed. The
+    # Augment wire is proprietary, so the body is forwarded unchanged in v1;
+    # inbound auth passes through untouched. (env: AUGMENT_TARGET_API_URL)
+    augment_api_url: str | None = None
     anyllm_provider: str = "openai"
 
     # Optimization mode: "token" (rewrite for max compression) or

@@ -1,0 +1,53 @@
+---
+title: AugmentCode Auggie Integration
+description: Route AugmentCode Auggie traffic through Headroom for proxy observability on your Augment subscription, without editing config or handling API keys.
+---
+
+Use `headroom wrap auggie` to route an [AugmentCode Auggie](https://docs.augmentcode.com/cli) session's traffic through the Headroom proxy with a single command. Auggie reads its tenant URL from its OAuth session, so the wrapper rewrites ONLY that URL to point at the local proxy (your access token is preserved byte-for-byte) and lets Auggie run normally. Every model, including Prism routing, stays on your Augment subscription. There are no config edits and no API keys to manage.
+
+## Quick Start
+
+```bash
+headroom wrap auggie
+```
+
+Pass arguments through to Auggie after `--`:
+
+```bash
+headroom wrap auggie -- -p "explain this repo" -m haiku4.5
+```
+
+## How it works
+
+Auggie authenticates with an OAuth session stored at `~/.augment/session.json` (`{accessToken, tenantURL, ...}`) and calls the `tenantURL` host for every request. `wrap auggie` reads that session, rewrites the `tenantURL` field to the local proxy, and hands the rewritten session to Auggie via the `AUGMENT_SESSION_AUTH` environment variable (only for the launched process). Auggie then sends every tenant call to the proxy, which forwards it verbatim to the real tenant resolved from the original session. Your Augment session credential is passed through untouched.
+
+| Step | What happens |
+|---|---|
+| Proxy | Starts the Headroom proxy in Auggie mode unless `--no-proxy` is set |
+| Redirect | Launches Auggie with a session whose `tenantURL` points at `http://127.0.0.1:<port>` (token unchanged) |
+| Observe | The `POST /chat-stream` inference call is tagged as the `augment` provider in `/stats`; every other tenant path (`/get-models`, `/agents/list-remote-tools`, ...) is forwarded as-is |
+| Upstream | Forwards to the tenant URL from your session by default, or to `--augment-api-url` (an enterprise or EU tenant) |
+
+## Options
+
+```bash
+headroom wrap auggie \
+  --port 8787 \                            # proxy port (default 8787)
+  --augment-api-url https://xlb.api.augmentcode.com \  # tenant upstream to forward to
+  --session-file ~/.augment/session.json \ # session JSON to read (default shown)
+  --no-proxy \                             # reuse an already-running proxy
+  --learn \                                # enable live traffic learning
+  --verbose
+```
+
+The upstream is resolved with this precedence: `--augment-api-url`, then the `tenantURL` from your session (so an enterprise or EU tenant you already use is preserved).
+
+## Compression status
+
+Auggie's tenant wire is Augment-proprietary (the inference call `POST /chat-stream` uses a bespoke request/response shape, not the Anthropic or OpenAI schema). This first version therefore **forwards inference bodies unchanged**: the value it delivers is the single-command redirect plus proxy observability (`/stats` attribution and the dashboard for your Auggie sessions, which otherwise report nothing). Request/response compression and output-token shaping for the Augment shape are planned follow-ups; they require an Augment-specific transform rather than the existing Anthropic/OpenAI pipelines.
+
+## Notes
+
+- Proxy dashboards bucket the inference traffic under the `augment` provider. (The real model id and token counts live in Auggie's proprietary response and are not yet parsed, so a v1 session shows the `augment` provider with a generic passthrough model label.)
+- If the target port already runs a Headroom proxy that is NOT in Auggie mode (for example a shared `headroom wrap claude` on the default `8787`), `wrap auggie` cannot serve Auggie's `/chat-stream` from it and stops with an error. Run Auggie on a dedicated port instead, e.g. `headroom wrap auggie --port 8790`.
+- Nothing durable is written (only the launched process's environment is set), so there is no `headroom unwrap auggie`: ending the session fully undoes the redirect. Your on-disk `~/.augment/session.json` is never modified.

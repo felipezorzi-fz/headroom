@@ -636,6 +636,7 @@ def _start_proxy(
     anyllm_provider: str | None = None,
     region: str | None = None,
     openai_api_url: str | None = None,
+    augment_api_url: str | None = None,
     anthropic_api_url: str | None = None,
     vertex_api_url: str | None = None,
     clear_vertex_api_url: bool = False,
@@ -687,6 +688,9 @@ def _start_proxy(
 
     if openai_api_url:
         cmd.extend(["--openai-api-url", openai_api_url])
+
+    if augment_api_url:
+        cmd.extend(["--augment-api-url", augment_api_url])
 
     if anthropic_api_url:
         cmd.extend(["--anthropic-api-url", anthropic_api_url])
@@ -4015,6 +4019,7 @@ def _ensure_proxy_unlocked(
     anyllm_provider: str | None = None,
     region: str | None = None,
     openai_api_url: str | None = None,
+    augment_api_url: str | None = None,
     anthropic_api_url: str | None = None,
     vertex_api_url: str | None = None,
     clear_vertex_api_url: bool = False,
@@ -4358,6 +4363,7 @@ def _ensure_proxy_unlocked(
                     anyllm_provider=anyllm_provider,
                     region=region,
                     openai_api_url=openai_api_url,
+                    augment_api_url=augment_api_url,
                     anthropic_api_url=anthropic_api_url,
                     vertex_api_url=vertex_api_url,
                     clear_vertex_api_url=clear_vertex_api_url,
@@ -4646,6 +4652,7 @@ def _launch_tool(
     anyllm_provider: str | None = None,
     region: str | None = None,
     openai_api_url: str | None = None,
+    augment_api_url: str | None = None,
     copilot_api_token: str | None = None,
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
@@ -4682,6 +4689,7 @@ def _launch_tool(
             anyllm_provider=anyllm_provider,
             region=region,
             openai_api_url=openai_api_url,
+            augment_api_url=augment_api_url,
             copilot_api_token=copilot_api_token,
             copilot_refresh_oauth_token=copilot_refresh_oauth_token,
             copilot_api_token_expires_at=copilot_api_token_expires_at,
@@ -4696,6 +4704,13 @@ def _launch_tool(
         if actual_port != port:
             for k, v in dict(env).items():
                 env[k] = v.replace(f"127.0.0.1:{port}", f"127.0.0.1:{actual_port}")
+            # Keep the printed banner consistent with the corrected env so the
+            # user does not see a stale port (e.g. a rewritten Auggie tenant URL
+            # or FACTORY_API_BASE_URL) that no longer matches the live proxy.
+            env_vars_display = [
+                line.replace(f"127.0.0.1:{port}", f"127.0.0.1:{actual_port}")
+                for line in env_vars_display
+            ]
 
         if configure_launch is not None:
             args, env, env_vars_display = configure_launch(actual_port, args, env, env_vars_display)
@@ -6221,6 +6236,155 @@ def _run_codex_wrap(
         anyllm_provider=anyllm_provider,
         region=region,
         configure_launch=configure_codex_launch,
+    )
+
+
+# =============================================================================
+# AugmentCode Auggie
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@_retired_context_tool_option
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--augment-api-url",
+    default=None,
+    help="Auggie tenant upstream to forward to (default: the tenantURL in ~/.augment/session.json)",
+)
+@click.option(
+    "--session-file",
+    default=None,
+    help="Path to the Auggie session JSON (default: ~/.augment/session.json)",
+)
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+@click.argument("auggie_args", nargs=-1, type=click.UNPROCESSED)
+def auggie(
+    port: int,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    augment_api_url: str | None,
+    session_file: str | None,
+    verbose: bool,
+    prepare_only: bool,
+    auggie_args: tuple,
+) -> None:
+    """Launch AugmentCode Auggie through Headroom proxy.
+
+    \b
+    Auggie reads its tenant URL from its OAuth session (``~/.augment/session.json``)
+    and calls that host for every request. This command rewrites ONLY the
+    ``tenantURL`` in that session to the local proxy (the access token is
+    preserved byte-for-byte), passes the rewritten session to Auggie via
+    ``AUGMENT_SESSION_AUTH``, and starts the proxy in Auggie mode. The proxy
+    forwards every Auggie tenant path verbatim to the real tenant and tags the
+    ``/chat-stream`` inference call as the ``augment`` provider in ``/stats``.
+    Use Auggie normally: any model, including Prism routing, runs on your Augment
+    subscription. No API keys and no persistent config edits.
+
+    \b
+    Note: Auggie's tenant wire is proprietary, so v1 forwards inference bodies
+    unchanged (no request compression yet); the value is the redirect plus proxy
+    telemetry/observability. Nothing durable is written, so there is no
+    ``unwrap auggie``: ending the session fully undoes it.
+
+    \b
+    Examples:
+        headroom wrap auggie                        # Start proxy + auggie
+        headroom wrap auggie -- -p "explain this"   # Pass args to auggie
+        headroom wrap auggie --port 8790            # Custom proxy port
+    """
+    from headroom.providers.augment import (
+        build_redirected_session,
+        load_session,
+        proxy_base_url,
+        resolve_augment_upstream,
+    )
+
+    session_path = Path(session_file) if session_file else None
+    try:
+        session = load_session(session_path)
+    except FileNotFoundError as exc:
+        raise click.ClickException(
+            f"No Auggie session found at {exc}. Run `auggie login` first (or pass --session-file)."
+        ) from exc
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    upstream = resolve_augment_upstream(session, augment_api_url)
+    if not upstream:
+        raise click.ClickException(
+            "Could not resolve the Auggie tenant URL. Re-run `auggie login`, or "
+            "pass --augment-api-url."
+        )
+
+    if prepare_only:
+        click.echo(f"AUGMENT_API_URL={proxy_base_url(port)}")
+        click.echo(f"upstream={upstream}")
+        return
+
+    auggie_bin = shutil.which("auggie")
+    if not auggie_bin:
+        click.echo("Error: 'auggie' not found in PATH.")
+        click.echo("Install AugmentCode Auggie: https://docs.augmentcode.com/cli")
+        raise SystemExit(1)
+
+    # Automatic port selection (no --port needed). Reuse an already-running
+    # Auggie proxy for THIS tenant; otherwise a proxy on this port belongs to a
+    # different session (a non-Auggie proxy like a shared `wrap claude`, or an
+    # Auggie proxy for another tenant) whose `/chat-stream` routing would
+    # misroute this session, so start a dedicated proxy on the next free port
+    # instead of disrupting it. `_launch_tool` rewrites the redirect to the
+    # actual port, so the child follows automatically.
+    if not no_proxy and _check_proxy(port):
+        running_config = _query_proxy_config(port)
+        running_augment = (
+            _normalize_proxy_api_url(running_config.get("augment_api_url"))
+            if running_config
+            else None
+        )
+        if running_augment != _normalize_proxy_api_url(upstream):
+            new_port = _find_available_port(port + 1)
+            if new_port != port:
+                click.echo(
+                    f"  Port {port} is serving a different session; using port "
+                    f"{new_port} for this Auggie session."
+                )
+                port = new_port
+
+    env = os.environ.copy()
+    # Scrub any inherited Augment redirect/session vars so a stale value from the
+    # parent shell cannot leak in and shadow the rewritten session we inject.
+    for _var in ("AUGMENT_SESSION_AUTH", "AUGMENT_API_URL", "AUGMENT_API_TOKEN"):
+        env.pop(_var, None)
+    # Env var (not --augment-session-json): a CLI arg would expose the access
+    # token to `ps aux` for every user on the box; the env var is only visible to
+    # the same uid. Scoped to this launched child; the wrap process env is intact.
+    env["AUGMENT_SESSION_AUTH"] = build_redirected_session(session, port)
+    env_vars_display = [
+        f"Auggie tenant URL rewritten -> {proxy_base_url(port)}",
+        f"Auggie tenant upstream: {upstream}",
+    ]
+
+    _launch_tool(
+        binary=auggie_bin,
+        args=auggie_args,
+        env=env,
+        port=port,
+        no_proxy=no_proxy,
+        tool_label="AUGGIE",
+        env_vars_display=env_vars_display,
+        learn=learn,
+        memory=memory,
+        agent_type="augment",
+        augment_api_url=upstream,
     )
 
 

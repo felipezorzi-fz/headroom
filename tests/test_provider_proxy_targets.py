@@ -78,3 +78,17 @@ def test_select_passthrough_base_url_handles_special_auth_modes() -> None:
         "https://legacy.anthropic.test"
     )
     assert select_passthrough_base_url(proxy, {}) == "https://legacy.openai.test"
+
+
+def test_select_passthrough_base_url_prefers_augment_upstream() -> None:
+    class _Config:
+        augment_api_url = "https://xlb.api.augmentcode.com/"
+
+    proxy = _proxy(OPENAI_API_URL="https://legacy.openai.test")
+    proxy.config = _Config()
+    # Auggie mode wins over normal metadata-provider routing; trailing slash trimmed.
+    assert select_passthrough_base_url(proxy, {}) == "https://xlb.api.augmentcode.com"
+    assert (
+        select_passthrough_base_url(proxy, {"x-api-key": "anthropic"})
+        == "https://xlb.api.augmentcode.com"
+    )

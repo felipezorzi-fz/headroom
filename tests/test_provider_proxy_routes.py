@@ -1347,3 +1347,67 @@ def test_anthropic_messages_strips_ansi_model_id_before_upstream() -> None:
 
     assert response.status_code == 200
     assert fake_http_client.bodies[0]["model"] == "claude-opus-4-8"
+
+
+def test_augment_chat_stream_route_registered_only_with_upstream() -> None:
+    """The /chat-stream route exists only when an Auggie upstream is configured."""
+    with_upstream = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            augment_api_url="https://xlb.api.augmentcode.com",
+        )
+    )
+    assert any(getattr(r, "path", None) == "/chat-stream" for r in with_upstream.routes)
+
+    without = create_app(ProxyConfig(optimize=False, cache_enabled=False, rate_limit_enabled=False))
+    assert not any(getattr(r, "path", None) == "/chat-stream" for r in without.routes)
+
+
+def test_augment_chat_stream_forwards_to_tenant_tagged_augment(monkeypatch) -> None:
+    """POST /chat-stream forwards verbatim to the tenant, tagged the `augment` provider."""
+    calls: list[tuple[str, str, str, str]] = []
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        calls.append((request.method, request.url.path, base_url, provider_name))
+        return JSONResponse({"ok": True})
+
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            augment_api_url="https://xlb.api.augmentcode.com/",
+        )
+    )
+    with TestClient(app) as client:
+        resp = client.post("/chat-stream", json={"message": "hi"})
+    assert resp.status_code == 200
+    assert calls == [("POST", "/chat-stream", "https://xlb.api.augmentcode.com", "augment")]
+
+
+def test_augment_chat_stream_forwards_malformed_body_unchanged(monkeypatch) -> None:
+    """A non-JSON /chat-stream body is forwarded verbatim (never parsed/rejected)."""
+    seen: dict[str, object] = {}
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        seen["body"] = await request.body()
+        seen["provider"] = provider_name
+        return JSONResponse({"ok": True})
+
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            augment_api_url="https://xlb.api.augmentcode.com",
+        )
+    )
+    with TestClient(app) as client:
+        resp = client.post("/chat-stream", content=b"not json{{{")
+    assert resp.status_code == 200
+    assert seen["body"] == b"not json{{{"
+    assert seen["provider"] == "augment"

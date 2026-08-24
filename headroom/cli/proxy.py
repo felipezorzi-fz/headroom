@@ -961,6 +961,17 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--augment-api-url",
+    default=None,
+    help=(
+        "Custom AugmentCode Auggie tenant upstream for the `headroom wrap auggie` "
+        "passthrough. When set, every Auggie tenant path (the `/chat-stream` "
+        "inference call plus `/get-models`, `/agents/list-remote-tools`, ...) is "
+        "forwarded here verbatim and `/chat-stream` is tagged `augment` in /stats. "
+        "(env: AUGMENT_TARGET_API_URL)"
+    ),
+)
+@click.option(
     "--telemetry",
     is_flag=True,
     help="Opt in to anonymous usage telemetry — off by default (env: HEADROOM_TELEMETRY=on)",
@@ -1093,6 +1104,7 @@ def proxy(
     bedrock_region: str | None,
     bedrock_profile: str | None,
     bedrock_api_url: str | None,
+    augment_api_url: str | None,
     telemetry: bool,
     no_telemetry: bool,
     stateless: bool,
@@ -1444,6 +1456,7 @@ def proxy(
         # CLI flag > env > unset. Matches the BEDROCK_TARGET_API_URL naming of
         # the sibling *_TARGET_API_URL passthrough overrides.
         bedrock_api_url=bedrock_api_url or os.environ.get("BEDROCK_TARGET_API_URL"),
+        augment_api_url=augment_api_url or os.environ.get("AUGMENT_TARGET_API_URL"),
         anyllm_provider=effective_anyllm_provider,
         # License / Usage Reporting (managed/enterprise)
         license_key=license_key,
