@@ -398,6 +398,7 @@ def test_core_tools_match_leading_underscore_namespace() -> None:
 
 from headroom.proxy.helpers import (  # noqa: E402
     strip_unsupported_tool_search_blocks,
+    strip_unsupported_tool_search_references,
 )
 
 _SEARCH_TOOL = {"type": _TOOL_SEARCH_DEFAULT_TYPE, "name": _TOOL_SEARCH_DEFAULT_NAME}
@@ -645,3 +646,40 @@ def test_repair_drops_when_referenced_tool_absent_despite_search_tool_present() 
     ]
     messages, removed = strip_unsupported_tool_search_blocks(transcript, tools)
     assert removed == 2
+
+
+# ---------------------------------------------------------------------------
+# tools-array repair: a tool_reference naming the search tool itself
+# ---------------------------------------------------------------------------
+
+
+def test_reference_repair_drops_typed_search_tool_reference() -> None:
+    # Anthropic answered a match-all search (empty input) with a hit on its own
+    # server tool.  Claude Code stored it in the session's loaded-tool set and
+    # replays it as a tool_reference, so every later turn 400s with "Tool
+    # reference 'tool_search_tool_regex' not found in available tools".  The
+    # block repair cannot see this: the poison is in tools, not the history.
+    tools = [
+        _SEARCH_TOOL,
+        {"type": "tool_reference", "name": _TOOL_SEARCH_DEFAULT_NAME},
+        {"type": "tool_reference", "name": "Bash"},
+        {"name": "Read", "input_schema": {}},
+    ]
+    repaired, removed = strip_unsupported_tool_search_references(tools)
+    assert removed == 1
+    assert {"type": "tool_reference", "name": "Bash"} in repaired
+    assert _SEARCH_TOOL in repaired  # the search mechanism itself must survive
+    assert all(
+        t.get("name") != _TOOL_SEARCH_DEFAULT_NAME
+        for t in repaired
+        if t.get("type") == "tool_reference"
+    )
+
+
+def test_reference_repair_is_a_noop_on_a_clean_tools_array() -> None:
+    # Identity return, so the caller skips the write-back and the prefix cache
+    # is not disturbed on the overwhelming majority of requests.
+    tools = [_SEARCH_TOOL, {"type": "tool_reference", "name": "Bash"}]
+    repaired, removed = strip_unsupported_tool_search_references(tools)
+    assert removed == 0
+    assert repaired is tools

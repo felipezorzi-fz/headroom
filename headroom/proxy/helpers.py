@@ -3073,6 +3073,39 @@ def _tool_search_reference_names(content: Any) -> list[str]:
     return names
 
 
+def strip_unsupported_tool_search_references(tools: Any) -> tuple[Any, int]:
+    """Drop ``tool_reference`` entries in ``tools`` that name a typed search tool.
+
+    Anthropic occasionally returns ``tool_search_tool_regex`` as a hit inside its
+    own match-all result (empty ``input``). Claude Code adds every hit to the
+    session's loaded-tool set and replays it as a ``tool_reference`` in ``tools``
+    on later turns, so upstream then 400s with "Tool reference
+    'tool_search_tool_regex' not found in available tools" — a typed search tool
+    is the search mechanism, never a reference target. The block repair below
+    cannot reach this: the poison is in the tools array, not the history, which
+    is why ``/compact`` does not clear it and the session stays dead.
+
+    Returns ``(tools, entries_removed)``, and the ORIGINAL ``tools`` object when
+    nothing was removed — callers rely on identity to skip the write-back.
+    """
+    if not isinstance(tools, list):
+        return tools, 0
+
+    kept = [
+        t
+        for t in tools
+        if not (
+            isinstance(t, dict)
+            and t.get("type") == "tool_reference"
+            and str(t.get("name") or t.get("tool_name") or "").startswith(
+                _TOOL_SEARCH_TOOL_TYPE_PREFIX
+            )
+        )
+    ]
+    removed = len(tools) - len(kept)
+    return (kept, removed) if removed else (tools, 0)
+
+
 def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any, int]:
     """Drop tool-search blocks this request's ``tools`` array cannot support.
 
