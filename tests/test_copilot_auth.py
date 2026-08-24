@@ -1615,3 +1615,57 @@ def test_exchange_token_sync_returns_payload_on_success(monkeypatch: pytest.Monk
     )
 
     assert result == payload
+
+
+def test_parse_expiry_reads_naive_iso_as_utc_not_local_time() -> None:
+    # A timezone-naive ISO expiry must resolve to the same epoch regardless of
+    # the host timezone. `datetime.timestamp()` assumes local time for naive
+    # datetimes, so before the fix this returned a host-dependent epoch that was
+    # hours off from the UTC-aware form on any non-UTC machine.
+    import os
+    import time as _time
+
+    prev_tz = os.environ.get("TZ")
+    try:
+        os.environ["TZ"] = "Asia/Kolkata"  # UTC+05:30, no DST
+        _time.tzset()
+
+        naive = copilot_auth._parse_expiry("2026-01-01T00:00:00")
+        aware = copilot_auth._parse_expiry("2026-01-01T00:00:00+00:00")
+        assert naive == aware
+        assert naive == 1767225600.0  # 2026-01-01T00:00:00Z
+    finally:
+        if prev_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = prev_tz
+        _time.tzset()
+
+
+def test_parse_expiry_reads_zulu_suffix_as_utc() -> None:
+    assert copilot_auth._parse_expiry("2026-01-01T00:00:00Z") == 1767225600.0
+
+
+def test_entry_expired_uses_utc_for_naive_iso_expiry() -> None:
+    # An entry whose expiry is a naive ISO string one hour in the future (UTC)
+    # must not be reported as already expired just because the host is ahead of
+    # UTC. Under Asia/Kolkata (+05:30), local-time misparsing pulled the epoch
+    # 5.5h earlier, flipping a live token to "expired".
+    import os
+    import time as _time
+    from datetime import datetime, timedelta, timezone
+
+    prev_tz = os.environ.get("TZ")
+    try:
+        os.environ["TZ"] = "Asia/Kolkata"
+        _time.tzset()
+
+        future_utc = datetime.now(timezone.utc) + timedelta(hours=1)
+        naive_iso = future_utc.replace(tzinfo=None).isoformat(timespec="seconds")
+        assert copilot_auth._entry_expired({"expires_at": naive_iso}) is False
+    finally:
+        if prev_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = prev_tz
+        _time.tzset()
