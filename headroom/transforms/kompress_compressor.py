@@ -74,6 +74,23 @@ def _add_kompress_must_keep_words(
             kept_ids.add(word_idx + chunk_start)
 
 
+def _format_ccr_retrieval_marker(
+    original_count: int,
+    compressed_count: int,
+    source_lines: int,
+    cache_key: str,
+) -> str:
+    """Render a Kompress marker without implying the source was damaged."""
+    line_word = "line" if source_lines == 1 else "lines"
+    return (
+        f"\n[{original_count} items compressed to {compressed_count}"
+        f" (from {source_lines} source {line_word})."
+        f" Retrieve more: hash={cache_key}."
+        f" Original content is intact; call headroom_retrieve(hash={cache_key})"
+        " for the full text.]"
+    )
+
+
 # ONNX artifacts are resolved against the model repo in this order, falling
 # through on download miss OR session-load failure:
 #
@@ -1703,12 +1720,11 @@ class KompressCompressor(Transform):
                     # Report the source line span so a reader can tell content was
                     # compressed away rather than absent — "items" counts words, which
                     # does not map to lines and reads as evidence of absence (#2586).
-                    source_lines = ccr_source.count("\n") + 1
-                    line_word = "line" if source_lines == 1 else "lines"
-                    result.compressed += (
-                        f"\n[{n_words} items compressed to {compressed_count}"
-                        f" (from {source_lines} source {line_word})."
-                        f" Retrieve more: hash={cache_key}]"
+                    result.compressed += _format_ccr_retrieval_marker(
+                        n_words,
+                        compressed_count,
+                        ccr_source.count("\n") + 1,
+                        cache_key,
                     )
 
             if inference_ms >= 1000.0:
@@ -2101,12 +2117,11 @@ class KompressCompressor(Transform):
                     # Report the source line span so a reader can tell content was
                     # compressed away rather than absent — "items" counts words, which
                     # does not map to lines and reads as evidence of absence (#2586).
-                    source_lines = ccr_source.count("\n") + 1
-                    line_word = "line" if source_lines == 1 else "lines"
-                    result.compressed += (
-                        f"\n[{n_words} items compressed to {compressed_count}"
-                        f" (from {source_lines} source {line_word})."
-                        f" Retrieve more: hash={cache_key}]"
+                    result.compressed += _format_ccr_retrieval_marker(
+                        n_words,
+                        compressed_count,
+                        ccr_source.count("\n") + 1,
+                        cache_key,
                     )
 
             results[text_idx] = result
