@@ -331,7 +331,7 @@ sandbox = [
 ]
 
 [project.scripts]
-headroom = "headroom.cli:main"
+headroom = "headroom.cli.main:main"
 
 [project.urls]
 Homepage = "https://headroom-docs.vercel.app"
