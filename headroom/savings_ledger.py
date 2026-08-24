@@ -13,6 +13,14 @@ model pricing changes later. litellm list pricing is used where the model is
 known; a blended input-token rate is used as a fallback (MCP-tool compressions
 do not know the agent's upstream model, so they record ``model="unknown"`` and
 fall back to the blended rate rather than recording ``$0``).
+
+Event schema (JSONL, one object per line): every event carries ``kind``
+("compress" | "retrieve"); events missing ``kind`` (older files) are read as
+"compress". Compress events use ``before``/``after``/``saved``; retrieve events
+carry ``tokens_retrieved`` (the re-injected payload plus a fixed per-retrieval
+overhead) and leave ``before``/``after``/``saved`` at 0. Net savings are derived
+at read time in ``aggregate_savings`` (never encoded as a negative ``saved``), so
+the format stays additive and a future Rust port can read it unchanged.
 """
 
 from __future__ import annotations
@@ -127,6 +135,8 @@ def record_savings_event(
     cost_usd: float | None = None,
     fallback_rate: float = DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN,
     path: str | os.PathLike[str] | None = None,
+    kind: str = "compress",
+    tokens_retrieved: int = 0,
 ) -> bool:
     """Append one savings event to the durable ledger. Never raises.
 
@@ -134,19 +144,29 @@ def record_savings_event(
     model + tokens saved when not supplied by the caller.
     """
 
+    kind = str(kind or "compress")
     try:
         before = max(int(tokens_before), 0)
         after = max(int(tokens_after), 0)
+        retrieved = max(int(tokens_retrieved), 0)
     except (TypeError, ValueError):
         return False
 
     saved = max(before - after, 0)
-    if saved <= 0:
+    if kind == "retrieve":
+        # A retrieval is a pure drawback: nothing is "saved"; it records the
+        # retrieved-back token volume so aggregate_savings can debit net.
+        if retrieved <= 0:
+            return False
+    elif saved <= 0:
         return False
 
     model_label = _normalize_model(model)
+    # Price the retrieval drawback from retrieved tokens; price compression
+    # savings from `saved`. Either way estimate_cost_usd charges the input rate.
+    cost_basis = retrieved if kind == "retrieve" else saved
     if cost_usd is None:
-        cost = estimate_cost_usd(model_label, saved, fallback_rate=fallback_rate)
+        cost = estimate_cost_usd(model_label, cost_basis, fallback_rate=fallback_rate)
     else:
         try:
             cost = max(float(cost_usd), 0.0)
@@ -156,9 +176,11 @@ def record_savings_event(
     event = {
         "v": SCHEMA_VERSION,
         "ts": _coerce_timestamp(timestamp).isoformat(),
+        "kind": kind,
         "before": before,
         "after": after,
         "saved": saved,
+        "tokens_retrieved": retrieved,
         "cost_usd": round(cost, 6),
         "model": model_label,
         "client": _label(client),
@@ -231,6 +253,9 @@ class _Bucket:
     tokens_before: int = 0
     cost_usd: float = 0.0
     calls: int = 0
+    tokens_retrieved: int = 0
+    retrieval_cost_usd: float = 0.0
+    retrievals: int = 0
 
     def add(self, *, saved: int, before: int, cost: float) -> None:
         self.tokens_saved += saved
@@ -238,11 +263,21 @@ class _Bucket:
         self.cost_usd += cost
         self.calls += 1
 
+    def add_retrieval(self, *, retrieved: int, cost: float) -> None:
+        self.tokens_retrieved += retrieved
+        self.retrieval_cost_usd += cost
+        self.retrievals += 1
+
     @property
     def savings_percent(self) -> float:
         if self.tokens_before <= 0:
             return 0.0
         return round(self.tokens_saved / self.tokens_before * 100, 1)
+
+    @property
+    def net_tokens_saved(self) -> int:
+        # Gross minus what retrievals re-injected. Never clamped: honest signal.
+        return self.tokens_saved - self.tokens_retrieved
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -251,6 +286,11 @@ class _Bucket:
             "cost_usd": round(self.cost_usd, 6),
             "calls": self.calls,
             "savings_percent": self.savings_percent,
+            "tokens_retrieved": self.tokens_retrieved,
+            "retrievals": self.retrievals,
+            "retrieval_cost_usd": round(self.retrieval_cost_usd, 6),
+            "net_tokens_saved": self.net_tokens_saved,
+            "net_cost_usd": round(self.cost_usd - self.retrieval_cost_usd, 6),
         }
 
 
@@ -315,25 +355,39 @@ def aggregate_savings(
 
     for event in events:
         ts: datetime = event["_ts"]
-        saved = max(int(event.get("saved", 0) or 0), 0)
-        before = max(int(event.get("before", 0) or 0), 0)
+        kind = str(event.get("kind") or "compress")
         try:
             cost = max(float(event.get("cost_usd", 0.0) or 0.0), 0.0)
         except (TypeError, ValueError):
             cost = 0.0
 
+        model_key = str(event.get("model") or UNKNOWN)
+        client_key = str(event.get("client") or UNKNOWN)
+
+        if kind == "retrieve":
+            # Retrieval drawback: debit the retrieved-back tokens against net.
+            retrieved = max(int(event.get("tokens_retrieved", 0) or 0), 0)
+            windowed.add_retrieval(retrieved=retrieved, cost=cost)
+            if ts >= today_cutoff:
+                today.add_retrieval(retrieved=retrieved, cost=cost)
+            if ts >= week_cutoff:
+                last_7.add_retrieval(retrieved=retrieved, cost=cost)
+            by_model.setdefault(model_key, _Bucket()).add_retrieval(retrieved=retrieved, cost=cost)
+            by_client.setdefault(client_key, _Bucket()).add_retrieval(
+                retrieved=retrieved, cost=cost
+            )
+            continue
+
+        saved = max(int(event.get("saved", 0) or 0), 0)
+        before = max(int(event.get("before", 0) or 0), 0)
         windowed.add(saved=saved, before=before, cost=cost)
         if ts >= today_cutoff:
             today.add(saved=saved, before=before, cost=cost)
         if ts >= week_cutoff:
             last_7.add(saved=saved, before=before, cost=cost)
 
-        by_model.setdefault(str(event.get("model") or UNKNOWN), _Bucket()).add(
-            saved=saved, before=before, cost=cost
-        )
-        by_client.setdefault(str(event.get("client") or UNKNOWN), _Bucket()).add(
-            saved=saved, before=before, cost=cost
-        )
+        by_model.setdefault(model_key, _Bucket()).add(saved=saved, before=before, cost=cost)
+        by_client.setdefault(client_key, _Bucket()).add(saved=saved, before=before, cost=cost)
 
     model_rows = _ranked(by_model, "model")
     top_model = model_rows[0]["model"] if model_rows else UNKNOWN

@@ -188,3 +188,7 @@ Check the effective setting at `/v1/retrieve/stats` under
 | CCR compression | None (reversible) | 70-90% |
 
 CCR gives you the savings of aggressive compression with zero risk. The LLM can always retrieve the original data if needed.
+
+## Retrieval cost accounting
+
+Retrieval isn't free. Each `headroom_retrieve` call re-injects the full original payload plus tool-call wrappers (about 50 tokens of overhead per retrieval) — that's real, billed cost that CCR's retrieved-back tokens must account for, so a retrieval never gets double-counted as pure savings. All three retrieval channels are debited into the net figure — the `headroom_retrieve` MCP tool, the proxy's in-process `headroom_retrieve` handler, and **proxy proactive expansion** (the proxy re-injecting relevant compressed content before the model asks). The dashboard surfaces a **CCR Retrievals** card (labelled "net (session)") showing retrieval count, retrieval rate, tokens retrieved back, estimated retrieval cost, and net tokens saved, plus a list of the tools with the highest retrieval rates — a load-bearing signal for when the compressor is dropping data the model needs.

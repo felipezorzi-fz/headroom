@@ -39,10 +39,16 @@ def _window_line(label: str, window: dict[str, Any]) -> str:
     saved = int(window.get("tokens_saved", 0) or 0)
     before = int(window.get("tokens_before", 0) or 0)
     cost = float(window.get("cost_usd", 0.0) or 0.0)
-    return (
+    retrieved = int(window.get("tokens_retrieved", 0) or 0)
+    net = int(window.get("net_tokens_saved", saved - retrieved) or 0)
+    line = (
         f"{label:<12} {_bar(pct)} {pct:5.1f}%  "
         f"saved {_tokens(saved)} / {_tokens(before)} tokens  {_money(cost)}"
     )
+    if retrieved:
+        # net uses {:,} so a negative net renders honestly (e.g. -1,234).
+        line += f"  \u00b7 retrieved-back {_tokens(retrieved)}  net {_tokens(net)}"
+    return line
 
 
 @main.command(name="savings")
