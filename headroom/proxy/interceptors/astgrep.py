@@ -13,15 +13,18 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
 from headroom import binaries
 from headroom._subprocess import run
 from headroom.proxy import runtime_env
+from headroom.proxy.project_context import get_current_cwd
 
 from . import base
 
@@ -88,6 +91,81 @@ _PATTERNS: dict[str, list[str]] = {
 
 OUTLINE_MARKER = "    # ... (body elided by Headroom; Read a specific line range to see it)\n"
 
+# Matches a line-based truncation notice emitted by a client
+# when its own token cap cuts a Read result short, e.g. "showing lines 1-1489
+# of 1825 total". Captures the client-provided line counts that Headroom can
+# safely report without guessing. Tolerates common formatting variations
+_TRUNCATION_RE = re.compile(
+    r"showing\s+lines?\s+\d+\s*[-–]\s*(?P<end_line>\d+)\s+of\s+(?P<total_lines>\d+)\s+total",
+    re.IGNORECASE,
+)
+
+
+def _detect_truncation(source: str) -> tuple[int, int] | None:
+    """Return (end_line, total_lines) if `source` carries an upstream truncation
+    banner, else None."""
+    m = _TRUNCATION_RE.search(source)
+    if not m:
+        return None
+    return int(m.group("end_line")), int(m.group("total_lines"))
+
+
+class ReadVerificationResult(Enum):
+    """Client-independent fallback for `_detect_truncation`'s banner regex:
+    compares tool_output against the real file on disk instead of parsing
+    client-specific prose. Only used when the banner regex finds nothing."""
+
+    COMPLETE = "complete"
+    TRUNCATED = "truncated"
+    # Unresolvable path, unreadable file, or mismatched content — never guess.
+    UNKNOWN = "unknown"
+
+
+def _verify_truncation_on_disk_enabled() -> bool:
+    # Live read (not a module constant), matching _min_chars_to_rewrite()'s
+    # hot-reload behavior.
+    return runtime_env.getenv("HEADROOM_VERIFY_TRUNCATION_ON_DISK", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _verify_read_against_disk(
+    file_path: str | None,
+    received_content: str,
+    cwd: str | None,
+) -> tuple[ReadVerificationResult, tuple[int, int] | None]:
+    """Compare `received_content` against the real file at `file_path`.
+
+    `cwd` (the `x-headroom-cwd` header) resolves a relative `file_path`.
+    TRUNCATED requires an exact-prefix match with strictly more on disk —
+    a weaker match means the file diverged since the client read it, not
+    a provable truncation, so it's UNKNOWN. Returns `(visible_lines,
+    total_lines)` alongside TRUNCATED so the header can cite real numbers
+    without a second, potentially racy, read.
+    """
+    if not file_path:
+        return ReadVerificationResult.UNKNOWN, None
+    if os.path.isabs(file_path):
+        resolved = file_path
+    elif cwd:
+        resolved = os.path.join(cwd, file_path)
+    else:
+        return ReadVerificationResult.UNKNOWN, None
+    try:
+        disk_content = Path(resolved).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        logger.debug("disk verification: cannot read %s: %s", resolved, e)
+        return ReadVerificationResult.UNKNOWN, None
+    if disk_content == received_content:
+        return ReadVerificationResult.COMPLETE, None
+    if disk_content.startswith(received_content) and len(disk_content) > len(received_content):
+        visible_lines = len(received_content.splitlines())
+        total_lines = len(disk_content.splitlines())
+        return ReadVerificationResult.TRUNCATED, (visible_lines, total_lines)
+    return ReadVerificationResult.UNKNOWN, None
+
 
 class AstGrepReadOutline:
     """Interceptor that outlines verbose code-file Read outputs."""
@@ -131,7 +209,15 @@ class AstGrepReadOutline:
         if not matches:
             return None
 
-        outline = _build_outline(matches, tool_output)
+        # Banner (cheap, no I/O) wins; disk verification is the opt-in fallback.
+        truncation = _detect_truncation(tool_output)
+        if truncation is None and _verify_truncation_on_disk_enabled():
+            verdict, disk_truncation = _verify_read_against_disk(
+                _path_from_input(tool_input), tool_output, get_current_cwd()
+            )
+            if verdict is ReadVerificationResult.TRUNCATED:
+                truncation = disk_truncation
+        outline = _build_outline(matches, tool_output, truncation)
         return outline if outline else None
 
     def progressive_disclosure_key(
@@ -258,12 +344,21 @@ def _run_ast_grep(
     return all_matches
 
 
-def _build_outline(matches: list[dict[str, Any]], source: str) -> str | None:
+def _build_outline(
+    matches: list[dict[str, Any]],
+    source: str,
+    truncation: tuple[int, int] | None = None,
+) -> str | None:
     """Build a compact outline from ast-grep matches.
 
     Emits each definition's signature line + docstring (if next line is a
     string literal) + an elision marker. Matches are sorted by byte offset
     so the outline tracks the original file order.
+
+    `truncation`, if given, is (end_line, total_lines) from an upstream
+    truncation banner already present in `source` (e.g. a client's own Read
+    token-cap notice). When set, the header states that the input was a
+    partial view instead of implying `source` is the whole file.
     """
     lines = source.splitlines(keepends=True)
     outline_chunks: list[str] = []
@@ -292,11 +387,21 @@ def _build_outline(matches: list[dict[str, Any]], source: str) -> str | None:
 
     if not outline_chunks:
         return None
-    header = (
-        "[headroom: outlined by ast-grep — "
-        f"{len(seen_starts)} definition(s); "
-        "bodies elided. Re-read the file with a line range to see a specific body.]\n"
-    )
+
+    if truncation:
+        end_line, total_lines = truncation
+        header = (
+            "[headroom: outlined by ast-grep — "
+            f"{len(seen_starts)} definition(s) in the visible portion; "
+            f"input was truncated upstream (showing through line {end_line} of {total_lines} total). "
+            "Bodies elided. Re-read remaining lines to see more.]\n"
+        )
+    else:
+        header = (
+            "[headroom: outlined by ast-grep — "
+            f"{len(seen_starts)} definition(s); "
+            "bodies elided. Re-read the file with a line range to see a specific body.]\n"
+        )
     return header + "".join(outline_chunks)
 
 

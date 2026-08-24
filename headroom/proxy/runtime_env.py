@@ -75,6 +75,11 @@ RUNTIME_ENV_KNOBS: tuple[Knob, ...] = (
         "int",
         "Min tool-output chars before the ast-grep read rewrite.",
     ),
+    Knob(
+        "HEADROOM_VERIFY_TRUNCATION_ON_DISK",
+        "bool",
+        "Verify ast-grep Read truncation against disk when no client banner is found.",
+    ),
 )
 
 _KNOBS_BY_ENV: dict[str, Knob] = {k.env: k for k in RUNTIME_ENV_KNOBS}
