@@ -768,7 +768,9 @@ def read_cached_oauth_token() -> str | None:
     return None
 
 
-def iter_oauth_token_candidates() -> list[CopilotTokenCandidate]:
+def iter_oauth_token_candidates(
+    *, include_platform_secret_stores: bool = True
+) -> list[CopilotTokenCandidate]:
     """Return reusable token candidates in safest-first discovery order."""
 
     candidates: list[CopilotTokenCandidate] = []
@@ -804,25 +806,8 @@ def iter_oauth_token_candidates() -> list[CopilotTokenCandidate]:
             )
         )
 
-    macos_copilot_token = _read_macos_keychain_oauth_token()
-    if macos_copilot_token:
-        candidates.append(
-            CopilotTokenCandidate(
-                token=macos_copilot_token,
-                source="macos-keychain:copilot-cli",
-                confidence="high",
-            )
-        )
-
-    linux_copilot_token = _read_linux_secret_oauth_token()
-    if linux_copilot_token:
-        candidates.append(
-            CopilotTokenCandidate(
-                token=linux_copilot_token,
-                source="linux-secret-service:copilot-cli",
-                confidence="high",
-            )
-        )
+    if include_platform_secret_stores:
+        candidates.extend(_platform_secret_store_oauth_token_candidates())
 
     candidates.extend(_read_file_oauth_token_candidates())
 
@@ -848,6 +833,31 @@ def iter_oauth_token_candidates() -> list[CopilotTokenCandidate]:
         )
 
     return _dedupe_token_candidates(candidates)
+
+
+def _platform_secret_store_oauth_token_candidates() -> list[CopilotTokenCandidate]:
+    """Return OAuth candidates from platform credential stores."""
+    candidates: list[CopilotTokenCandidate] = []
+    macos_copilot_token = _read_macos_keychain_oauth_token()
+    if macos_copilot_token:
+        candidates.append(
+            CopilotTokenCandidate(
+                token=macos_copilot_token,
+                source="macos-keychain:copilot-cli",
+                confidence="high",
+            )
+        )
+
+    linux_copilot_token = _read_linux_secret_oauth_token()
+    if linux_copilot_token:
+        candidates.append(
+            CopilotTokenCandidate(
+                token=linux_copilot_token,
+                source="linux-secret-service:copilot-cli",
+                confidence="high",
+            )
+        )
+    return candidates
 
 
 def _read_file_oauth_token_candidates() -> list[CopilotTokenCandidate]:
@@ -1113,9 +1123,34 @@ def resolve_subscription_bearer_token_details() -> CopilotSubscriptionTokenResol
                 api_url=_subscription_api_url_from_user_info_payload(payload),
             )
 
-    for candidate in iter_oauth_token_candidates():
+    attempted_tokens: set[str] = set()
+    resolution = _resolve_subscription_oauth_token_candidates(
+        iter_oauth_token_candidates(include_platform_secret_stores=False),
+        attempted_tokens=attempted_tokens,
+    )
+    if resolution is not None:
+        return resolution
+
+    return _resolve_subscription_oauth_token_candidates(
+        [
+            candidate
+            for candidate in _platform_secret_store_oauth_token_candidates()
+            if candidate.token not in attempted_tokens
+        ]
+    )
+
+
+def _resolve_subscription_oauth_token_candidates(
+    candidates: list[CopilotTokenCandidate],
+    *,
+    attempted_tokens: set[str] | None = None,
+) -> CopilotSubscriptionTokenResolution | None:
+    """Return the first candidate GitHub accepts for subscription APIs."""
+    for candidate in candidates:
         if not candidate.validate_for_subscription:
             continue
+        if attempted_tokens is not None:
+            attempted_tokens.add(candidate.token)
         if _is_copilot_api_token(candidate.token):
             payload = _fetch_copilot_user_info(candidate.token)
             if payload is not None:
