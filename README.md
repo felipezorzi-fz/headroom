@@ -217,9 +217,9 @@ shows an **Output Tokens Saved** card next to input compression, labelled
 
 → Full write-up incl. the measurement methodology: [Output token reduction](https://headroom-docs.vercel.app/docs/savings)
 
-<a href="https://www.star-history.com/?repos=chopratejas%2Fheadroom&type=date&legend=top-left">
+<a href="https://star-history.dera.page/#chopratejas/headroom&type=date&legend=top-left">
  <picture>
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=chopratejas/headroom&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=chopratejas/headroom&type=date&legend=top-left" />
  </picture>
 </a>
 
