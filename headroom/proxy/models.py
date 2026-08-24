@@ -12,6 +12,7 @@ from dataclasses import InitVar, dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
+from headroom.graph.backend import DEFAULT_CODE_GRAPH_BACKEND
 from headroom.memory import qdrant_env
 from headroom.providers.registry import ProviderApiOverrides
 from headroom.proxy.buffered_ccr_response import DEFAULT_BUFFERED_CCR_GRACE_SECONDS
@@ -260,6 +261,9 @@ class ProxyConfig:
 
     # Code graph live watcher (triggers incremental reindex on file changes)
     code_graph_watcher: bool = False
+    # Selected code-graph implementation. The current default is tokensave;
+    # legacy codebase-memory-mcp and CodeGraph remain explicit alternatives.
+    code_graph_backend: str = DEFAULT_CODE_GRAPH_BACKEND.value
 
     # Per-tool compression profiles
     tool_profiles: dict[str, Any] | None = None

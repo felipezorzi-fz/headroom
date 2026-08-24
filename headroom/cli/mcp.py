@@ -212,6 +212,12 @@ def mcp_uninstall() -> None:
             )
             removed = True
 
+    from headroom.graph.codegraph_installer import uninstall_codegraph
+
+    if uninstall_codegraph():
+        click.echo("CodeGraph agent configuration removed.")
+        removed = True
+
     if not removed:
         click.echo("Headroom MCP is not configured. Nothing to uninstall.")
 

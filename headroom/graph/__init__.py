@@ -1,5 +1,17 @@
-"""Code graph intelligence for headroom.
+"""Code graph intelligence and backend selection for Headroom."""
 
-Provides live code graph reindexing via file watching, with
-codebase-memory-mcp as the graph backend.
-"""
+from .backend import (
+    CODE_GRAPH_BACKEND_CHOICES,
+    DEFAULT_CODE_GRAPH_BACKEND,
+    CodeGraphBackend,
+    normalize_code_graph_backend,
+    resolve_code_graph_backend,
+)
+
+__all__ = [
+    "CODE_GRAPH_BACKEND_CHOICES",
+    "DEFAULT_CODE_GRAPH_BACKEND",
+    "CodeGraphBackend",
+    "normalize_code_graph_backend",
+    "resolve_code_graph_backend",
+]

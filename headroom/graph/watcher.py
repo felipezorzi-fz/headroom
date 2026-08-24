@@ -1,8 +1,8 @@
 """File watcher for live code graph reindexing.
 
 Monitors the project directory for source file changes and triggers
-incremental reindexing via codebase-memory-mcp. Runs as a background
-thread in the proxy process.
+incremental reindexing via the selected legacy graph backend. Runs as a
+background thread in the proxy process. CodeGraph uses its own native watcher.
 
 Cross-platform: uses watchdog (FSEvents on macOS, inotify on Linux,
 ReadDirectoryChangesW on Windows).
@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 
 from headroom._subprocess import run
+from headroom.graph.backend import CodeGraphBackend, normalize_code_graph_backend
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +104,8 @@ class CodeGraphWatcher:
     Args:
         project_dir: Root directory to watch.
         debounce_seconds: Wait this long after last change before reindexing.
-        cbm_binary: Path to codebase-memory-mcp binary. Auto-detected if None.
+        cbm_binary: Legacy argument for the selected backend binary. Auto-detected
+            when omitted.
     """
 
     def __init__(
@@ -111,13 +113,15 @@ class CodeGraphWatcher:
         project_dir: str | Path,
         debounce_seconds: float = 2.0,
         cbm_binary: str | None = None,
+        backend: str | CodeGraphBackend = CodeGraphBackend.CODEBASE_MEMORY,
     ) -> None:
         self.project_dir = str(project_dir)
         self.debounce_seconds = debounce_seconds
+        self.backend = normalize_code_graph_backend(backend)
         self.cbm_binary: str | None = None
         if cbm_binary:
             self.cbm_binary = cbm_binary
-        else:
+        elif self.backend == CodeGraphBackend.CODEBASE_MEMORY:
             from headroom.graph.installer import get_cbm_path
 
             path = get_cbm_path()
@@ -132,7 +136,9 @@ class CodeGraphWatcher:
     def start(self) -> bool:
         """Start watching in a background thread. Returns True if started."""
         if not self.cbm_binary:
-            logger.debug("Code graph watcher: codebase-memory-mcp not found, not starting")
+            logger.debug(
+                "Code graph watcher: %s binary not found, not starting", self.backend.value
+            )
             return False
 
         try:
@@ -213,19 +219,20 @@ class CodeGraphWatcher:
             self._debounce_timer.start()
 
     def _do_reindex(self) -> None:
-        """Trigger incremental reindex via codebase-memory-mcp."""
+        """Trigger a debounced incremental reindex for the selected backend."""
         if not self._running or not self.cbm_binary:
             return
 
         try:
             start = time.monotonic()
+            command = [
+                self.cbm_binary,
+                "cli",
+                "index_repository",
+                json.dumps({"repo_path": self.project_dir, "mode": "fast"}),
+            ]
             result = run(
-                [
-                    self.cbm_binary,
-                    "cli",
-                    "index_repository",
-                    json.dumps({"repo_path": self.project_dir, "mode": "fast"}),
-                ],
+                command,
                 capture_output=True,
                 text=True,
                 timeout=30,

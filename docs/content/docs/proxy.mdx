@@ -71,7 +71,29 @@ Avoid setting process-wide variables such as `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_P
 | `--intercept-tool-results` | `false` | Opt into canary tool-result interceptors such as ast-grep Read outlining. Requires `HEADROOM_ROLLOUT_CHANNEL=canary` (or `dev`). |
 | `--no-read-lifecycle` | `false` | Disable stale/superseded Read-output compression. |
 | `--code-aware` / `--no-code-aware` | disabled | Enable or disable AST-based code compression. Requires `headroom-ai[code]`. |
-| `--code-graph` | `false` | Enable the proxy's live code-graph file watcher for the current project. |
+| `--code-graph` | `false` | Enable code-graph indexing for the current project. |
+| `--code-graph-backend <backend>` | `codebase-memory-mcp` | Select `codebase-memory-mcp` or `codegraph`. |
+
+#### Code-graph backend selection
+
+`--code-graph` enables project indexing. The backend can be selected with
+`--code-graph-backend`, `HEADROOM_CODE_GRAPH_BACKEND`, or a `code_graph_backend`
+key in `headroom.toml` or `headroom.yaml`. The precedence is CLI, environment,
+config file, then the current default (`codebase-memory-mcp`).
+
+CodeGraph is installed through npm and initialized in the current project:
+
+```bash
+npm install --global @colbymchenry/codegraph
+headroom wrap claude --code-graph --code-graph-backend codegraph
+```
+
+Headroom runs `codegraph install` to register the detected agent and
+`codegraph init` to create the project's `.codegraph/` index. CodeGraph keeps
+its own file watcher active; Headroom's watchdog watcher remains for the
+`codebase-memory-mcp` backend. `headroom unwrap <agent>` and
+`headroom mcp uninstall` remove CodeGraph's agent configuration while keeping
+the CLI installed.
 
 #### Code-memory MCP (Serena)
 

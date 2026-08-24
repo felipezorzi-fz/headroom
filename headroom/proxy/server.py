@@ -1356,13 +1356,33 @@ class HeadroomProxy(
         # Code graph file watcher (live reindex on file changes)
         self.code_graph_watcher: CodeGraphWatcher | None = None  # type: ignore[annotation-unchecked]
         if config.code_graph_watcher:
-            from headroom.graph.watcher import CodeGraphWatcher
+            from headroom.graph.backend import CodeGraphBackend, resolve_code_graph_backend
 
-            self.code_graph_watcher = CodeGraphWatcher(project_dir=Path.cwd())
-            if self.code_graph_watcher.start():
-                logger.info("Code graph: file watcher started")
+            graph_backend = resolve_code_graph_backend(config.code_graph_backend)
+            if graph_backend == CodeGraphBackend.CODEGRAPH:
+                from headroom.graph.codegraph_installer import (
+                    ensure_codegraph,
+                    initialize_codegraph,
+                )
+
+                codegraph_binary = ensure_codegraph()
+                if codegraph_binary and initialize_codegraph(
+                    codegraph_binary, project_dir=Path.cwd()
+                ):
+                    logger.info("Code graph: CodeGraph initialized (built-in watcher active)")
+                else:
+                    logger.warning("Code graph: CodeGraph unavailable; continuing without index")
             else:
-                self.code_graph_watcher = None
+                from headroom.graph.watcher import CodeGraphWatcher
+
+                self.code_graph_watcher = CodeGraphWatcher(
+                    project_dir=Path.cwd(),
+                    backend=graph_backend,
+                )
+                if self.code_graph_watcher.start():
+                    logger.info("Code graph: file watcher started (%s)", graph_backend.value)
+                else:
+                    self.code_graph_watcher = None
 
         self.pipeline_extensions.emit(
             PipelineStage.SETUP,
@@ -3100,6 +3120,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "memory": config.memory_enabled,
                 "learn": config.traffic_learning_enabled,
                 "code_graph": config.code_graph_watcher,
+                "code_graph_backend": config.code_graph_backend,
                 "anthropic_api_url": config.anthropic_api_url,
                 "openai_api_url": config.openai_api_url,
                 "gemini_api_url": config.gemini_api_url,
