@@ -28,6 +28,7 @@ The canonical, always-current documentation index lives at the docs site below. 
 - [Quickstart](https://headroom-docs.vercel.app/docs/quickstart): 5-minute end-to-end (install → compress → call the model).
 - [Installation](https://headroom-docs.vercel.app/docs/installation): All install paths, extras, Docker tags, env vars.
 - [Proxy server](https://headroom-docs.vercel.app/docs/proxy): Run as a local HTTP proxy in front of OpenAI / Anthropic / Gemini.
+- [DeepSeek Harness (dsh)](wiki/dsh.md): `headroom wrap dsh` / `unwrap dsh` — route DeepSeek Harness chat traffic through the compression proxy.
 - [MCP server](https://headroom-docs.vercel.app/docs/mcp): `headroom_compress`, `headroom_retrieve`, `headroom_stats` for Claude Code / Cursor / any MCP host.
 - [API reference](https://headroom-docs.vercel.app/docs/api-reference): Python + TypeScript `compress()` API.
 
