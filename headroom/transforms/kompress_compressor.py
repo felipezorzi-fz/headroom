@@ -25,6 +25,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from ..ccr.marker import terse_marker, terse_markers_enabled
 from ..config import TransformResult
 from ..onnx_runtime import (
     ONNX_CPU_ARENA_ENV,
@@ -1700,16 +1701,16 @@ class KompressCompressor(Transform):
                 cache_key = self._store_in_ccr(ccr_source, compressed, ccr_source_tokens)
                 if cache_key:
                     result.cache_key = cache_key
-                    # Report the source line span so a reader can tell content was
-                    # compressed away rather than absent — "items" counts words, which
-                    # does not map to lines and reads as evidence of absence (#2586).
-                    source_lines = ccr_source.count("\n") + 1
-                    line_word = "line" if source_lines == 1 else "lines"
-                    result.compressed += (
-                        f"\n[{n_words} items compressed to {compressed_count}"
-                        f" (from {source_lines} source {line_word})."
-                        f" Retrieve more: hash={cache_key}]"
-                    )
+                    if terse_markers_enabled():
+                        result.compressed += f"\n{terse_marker(cache_key)}"
+                    else:
+                        source_lines = ccr_source.count("\n") + 1
+                        line_word = "line" if source_lines == 1 else "lines"
+                        result.compressed += (
+                            f"\n[{n_words} items compressed to {compressed_count}"
+                            f" (from {source_lines} source {line_word})."
+                            f" Retrieve more: hash={cache_key}]"
+                        )
 
             if inference_ms >= 1000.0:
                 logger.info(
@@ -2098,16 +2099,16 @@ class KompressCompressor(Transform):
                 cache_key = self._store_in_ccr(ccr_source, compressed, ccr_source_tokens)
                 if cache_key:
                     result.cache_key = cache_key
-                    # Report the source line span so a reader can tell content was
-                    # compressed away rather than absent — "items" counts words, which
-                    # does not map to lines and reads as evidence of absence (#2586).
-                    source_lines = ccr_source.count("\n") + 1
-                    line_word = "line" if source_lines == 1 else "lines"
-                    result.compressed += (
-                        f"\n[{n_words} items compressed to {compressed_count}"
-                        f" (from {source_lines} source {line_word})."
-                        f" Retrieve more: hash={cache_key}]"
-                    )
+                    if terse_markers_enabled():
+                        result.compressed += f"\n{terse_marker(cache_key)}"
+                    else:
+                        source_lines = ccr_source.count("\n") + 1
+                        line_word = "line" if source_lines == 1 else "lines"
+                        result.compressed += (
+                            f"\n[{n_words} items compressed to {compressed_count}"
+                            f" (from {source_lines} source {line_word})."
+                            f" Retrieve more: hash={cache_key}]"
+                        )
 
             results[text_idx] = result
 
