@@ -12,6 +12,13 @@ _INPUT_BUCKETS = (2_000, 8_000, 32_000, 128_000)
 _STRATUM_LABEL = "output_shaper:stratum:"
 _CONTROL_LABEL = "output_shaper:control:"
 
+# Cost guard for the conversation-key seed, not a semantic limit: hashing runs
+# once per request and injected client boilerplate never approaches this, so it
+# only bounds a pathological paste. Keep it far above any prologue -- the last
+# cap was 512 characters and client context blocks routinely exceed that by an
+# order of magnitude, which is the bug this number must not recreate.
+_MAX_SEED_CHARS = 65_536
+
 
 def input_bucket(input_tokens: int) -> str:
     """Map an input-token count to a coarse bucket label."""
@@ -106,7 +113,26 @@ def _stable_response_identifier(body: dict[str, Any]) -> str:
 
 
 def conversation_key_from_body(body: dict[str, Any]) -> str:
-    """Derive a conversation-stable key for holdout assignment."""
+    """Derive a conversation-stable key for holdout assignment.
+
+    Every text block of the first user message feeds the seed, in full.
+
+    Seeding on the first 512 characters of the *first* block collapsed whole
+    populations of conversations onto one key, because agent clients open a
+    conversation with injected context -- CLAUDE.md, IDE selection, memory
+    digests -- that is byte-identical for every conversation in a project and
+    far longer than 512 characters. The user's own words, the part that makes
+    one conversation different from the next, sat past the cut.
+
+    One key means one arm, permanently, since the assignment is deterministic:
+    on a real 78k-request ledger that left fable at 22,222 treatment requests
+    against 1 control and sonnet at 15,401 against 0, while opus accumulated
+    3,532 control samples -- a holdout nominally set to 3% that had in fact
+    frozen each client into a single arm. Reading the whole message restores
+    the intended unit of randomization without weakening stability: user turns
+    are never compressed, so the first message is immutable for the life of
+    the conversation.
+    """
     body = _unwrap_response_create_body(body)
     model = str(body.get("model", ""))
     seed = model
@@ -114,12 +140,14 @@ def conversation_key_from_body(body: dict[str, Any]) -> str:
         if isinstance(msg, dict) and msg.get("role") == "user":
             content = msg.get("content")
             if isinstance(content, str):
-                seed += "\x00" + content[:512]
+                seed += "\x00" + content[:_MAX_SEED_CHARS]
             elif isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        seed += "\x00" + str(block.get("text", ""))[:512]
-                        break
+                blocks = [
+                    str(block.get("text", ""))
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                ]
+                seed += "\x00" + "\x00".join(blocks)[:_MAX_SEED_CHARS]
             break
     if "input" in body:
         stable_response_key = _stable_response_identifier(body)

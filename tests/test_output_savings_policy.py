@@ -52,6 +52,62 @@ def test_conversation_key_uses_response_create_payload() -> None:
     assert conversation_key_from_body(http_body) == conversation_key_from_body(ws_body)
 
 
+def test_conversation_key_survives_a_long_identical_client_prologue() -> None:
+    """Two conversations differing only past a long injected prologue.
+
+    Agent clients open every conversation with the same context blocks
+    (project instructions, IDE state, memory), commonly kilobytes long. Keying
+    on a 512-character prefix gave all of them one key, so a whole client sat
+    in one arm permanently and never produced holdout data.
+    """
+    prologue = "<system-reminder>project instructions. </system-reminder>" * 40
+    assert len(prologue) > 512
+
+    def body(question: str) -> dict[str, object]:
+        return {
+            "model": "claude-opus-4-5",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prologue},
+                        {"type": "text", "text": question},
+                    ],
+                }
+            ],
+        }
+
+    assert conversation_key_from_body(body("add a cache")) != conversation_key_from_body(
+        body("delete the cache")
+    )
+    # Same words, same conversation: still one key, so the arm stays stable.
+    assert conversation_key_from_body(body("add a cache")) == conversation_key_from_body(
+        body("add a cache")
+    )
+
+
+def test_conversation_key_ignores_non_text_blocks() -> None:
+    """An image block carries no conversation identity and must not seed."""
+    text_only = {
+        "model": "claude-opus-4-5",
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "ship it"}]}],
+    }
+    with_image = {
+        "model": "claude-opus-4-5",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"data": "iVBORw0KGgo="}},
+                    {"type": "text", "text": "ship it"},
+                ],
+            }
+        ],
+    }
+
+    assert conversation_key_from_body(text_only) == conversation_key_from_body(with_image)
+
+
 def test_stratum_label_round_trips_arm_and_key() -> None:
     key = "opus|code|m|tools"
 
