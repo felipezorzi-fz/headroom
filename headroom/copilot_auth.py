@@ -613,6 +613,37 @@ def read_headroom_copilot_oauth_token() -> str | None:
     return token.strip() if isinstance(token, str) and token.strip() else None
 
 
+def _write_private_text(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` so the file is never world/group readable.
+
+    The token file holds a GitHub Copilot OAuth refresh token. Writing with
+    ``path.write_text`` then ``chmod(0o600)`` creates the file at the umask
+    default (typically ``0o644``) and only narrows it afterward, leaving a
+    window — or, if the process dies between the two calls, a permanent state —
+    where a local unprivileged user can read the token.
+
+    ``os.open`` with an explicit ``0o600`` mode makes a *new* file private from
+    birth (umask can only clear bits, never add them, and ``0o600`` already has
+    none for group/other). An existing file's mode is not changed by ``O_CREAT``,
+    so narrow it first — before the new secret is written into it — and once more
+    after, belt-and-suspenders. Mirrors ``telemetry/session.py``'s install-id
+    write. On Windows ``chmod`` is largely a no-op and POSIX perms do not apply,
+    so failures are ignored.
+    """
+    try:
+        if path.exists():
+            path.chmod(0o600)
+    except OSError:
+        pass
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
 def save_headroom_copilot_oauth_token(
     token: str,
     *,
@@ -633,11 +664,7 @@ def save_headroom_copilot_oauth_token(
         "domain": _github_oauth_domain(domain),
         "created_at": int(time.time()),
     }
-    path.write_text(json.dumps(body, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
+    _write_private_text(path, json.dumps(body, indent=2, sort_keys=True) + "\n")
     return path
 
 

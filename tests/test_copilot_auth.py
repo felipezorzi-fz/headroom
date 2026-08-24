@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -90,6 +91,45 @@ def test_read_cached_oauth_token_prefers_headroom_login(
     copilot_auth.save_headroom_copilot_oauth_token("gho-headroom")
 
     assert copilot_auth.read_cached_oauth_token() == "gho-headroom"
+
+
+def test_saved_oauth_token_file_content_roundtrips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The token still writes and reads back after the private-write change."""
+    copilot_auth.save_headroom_copilot_oauth_token("gho-headroom")
+    assert copilot_auth.read_cached_oauth_token() == "gho-headroom"
+    # Re-saving over an existing file rotates the token cleanly.
+    copilot_auth.save_headroom_copilot_oauth_token("gho-rotated")
+    assert copilot_auth.read_cached_oauth_token() == "gho-rotated"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits only")
+def test_saved_oauth_token_file_is_born_private(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The token file must be *created* 0o600, not created wide then narrowed.
+
+    The refresh token is written the instant the file is created. Writing via
+    ``write_text`` then ``chmod(0o600)`` creates the file at the umask default
+    and only narrows it afterward, so the secret briefly lives in a
+    group/world-readable file (permanently if the process dies in the gap).
+
+    Asserting the *final* mode does not catch this — the trailing chmod always
+    makes it 0o600. To exercise the actual defect, this neutralizes every chmod
+    and forces a permissive umask, so the mode reflects only how the file was
+    *created*: born-private ``os.open(..., 0o600)`` still yields 0o600, while the
+    old write-then-chmod would leave 0o644 with chmod removed.
+    """
+    monkeypatch.setattr(Path, "chmod", lambda self, mode: None)
+    old_umask = os.umask(0o022)
+    try:
+        path = Path(copilot_auth.save_headroom_copilot_oauth_token("gho-headroom"))
+    finally:
+        os.umask(old_umask)
+
+    assert path.exists()
+    assert (path.stat().st_mode & 0o777) == 0o600, (
+        "token file must be created private, not narrowed after a wide creation"
+    )
 
 
 def test_default_oauth_domain_uses_enterprise_url_host(monkeypatch: pytest.MonkeyPatch) -> None:
