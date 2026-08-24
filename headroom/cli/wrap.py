@@ -32,7 +32,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
@@ -3609,6 +3609,58 @@ def _proxy_needs_version_restart(payload: dict[str, Any] | None) -> bool:
     )
 
 
+# Upstream-URL config keys that decide where a running proxy forwards
+# traffic. A running proxy is only reusable when every key matches the
+# requested value. This build's /health config payload only serializes the
+# first five keys; the augment/factory entries catch proxies built from
+# feature branches or other versions that DO expose them (exactly the
+# mixed-fleet shape of the 2026-08-22 incident, where a 0.34-era proxy
+# reported augment_api_url). Keys absent from the running config simply
+# compare equal to an unrequested (None) value, so they are inert, never
+# wrong, against proxies that do not expose them.
+_PROXY_ROUTING_URL_KEYS = (
+    "openai_api_url",
+    "anthropic_api_url",
+    "vertex_api_url",
+    "cloudcode_api_url",
+    "gemini_api_url",
+    "augment_api_url",
+    "factory_api_url",
+)
+
+
+def _proxy_routing_mismatches(
+    running_config: Mapping[str, Any],
+    *,
+    backend: str | None,
+    requested_api_urls: Mapping[str, str | None] | None = None,
+) -> list[str]:
+    """Return routing-level keys where a running proxy differs from the request.
+
+    Unlike the feature-flag check in ``_ensure_proxy_unlocked`` (memory,
+    learn, code graph), a mismatch here is never "degraded but usable": the
+    proxy would forward this session's traffic to a backend or upstream the
+    caller did not ask for. URL comparison is symmetric: a running proxy with
+    a non-default upstream the caller did not request is a mismatch too.
+    """
+    mismatches: list[str] = []
+    effective_backend = backend or os.environ.get("HEADROOM_BACKEND") or "anthropic"
+    running_backend = running_config.get("backend")
+    if (
+        isinstance(running_backend, str)
+        and running_backend
+        and running_backend != effective_backend
+    ):
+        mismatches.append("backend")
+    requested_api_urls = requested_api_urls or {}
+    for key in _PROXY_ROUTING_URL_KEYS:
+        if _normalize_proxy_api_url(running_config.get(key)) != _normalize_proxy_api_url(
+            requested_api_urls.get(key)
+        ):
+            mismatches.append(key)
+    return mismatches
+
+
 def _detect_running_proxy_backend(port: int) -> str | None:
     """Read the backend of an already-running proxy from its health endpoint."""
     return _copilot_detect_running_proxy_backend(port)
@@ -4035,6 +4087,11 @@ def _ensure_proxy_unlocked(
         or bool(copilot_refresh_oauth_token)
         or copilot_api_token_expires_at is not None
     )
+    # Set True when the proxy on the requested port belongs to a persistent
+    # deployment whose routing config does not match this wrap: the deployment
+    # owns the port and must not be reused, killed, or restarted from the
+    # shared ephemeral path; the wrap starts a dedicated proxy elsewhere.
+    persistent_routing_mismatch = False
     # --no-proxy reuses an already-running proxy, so backend/region/provider
     # flags (which only apply when we start one) would be silently dropped.
     if no_proxy and (backend or anyllm_provider or region):
@@ -4106,12 +4163,35 @@ def _ensure_proxy_unlocked(
                         requested_openai_url = _normalize_proxy_api_url(openai_api_url)
                         if running_openai_url != requested_openai_url:
                             missing.append("openai-api-url")
-                    if not missing:
+                    routing_mismatches = helpers._proxy_routing_mismatches(
+                        running_config,
+                        backend=backend,
+                        requested_api_urls={
+                            "openai_api_url": openai_api_url,
+                            "anthropic_api_url": anthropic_api_url,
+                            "vertex_api_url": (None if clear_vertex_api_url else vertex_api_url),
+                        },
+                    )
+                    if routing_mismatches:
+                        # A persistent deployment's routing comes from its
+                        # manifest; the shared ephemeral path must not kill it
+                        # (the manifest would point at a dead or hijacked
+                        # port). Start this wrap's proxy on a free port and
+                        # leave the deployment running.
+                        keys_str = ", ".join(routing_mismatches)
+                        click.echo(
+                            f"  Persistent deployment '{manifest.profile}' on port {port} "
+                            f"has incompatible routing config ({keys_str}); "
+                            "starting a dedicated proxy on a different port instead."
+                        )
+                        persistent_routing_mismatch = True
+                    elif not missing:
                         click.echo(f"  Proxy already running on port {port}")
                         click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
                         return None, port
-                # Features mismatch or config unavailable — fall through to
-                # the non-persistent path which handles proxy restart.
+                # Features mismatch or config unavailable — fall through to the
+                # non-persistent path which handles proxy restart. A routing
+                # mismatch skips that path entirely (see flag above).
             else:
                 if helpers._recover_persistent_proxy(port):
                     # If the caller requested feature-sensitive config (e.g.
@@ -4193,13 +4273,34 @@ def _ensure_proxy_unlocked(
                 "is stale; starting a fresh proxy instead."
             )
 
-        if not isolated_copilot_subscription_proxy and helpers._check_proxy(port):
+        if (
+            not isolated_copilot_subscription_proxy
+            and not persistent_routing_mismatch
+            and helpers._check_proxy(port)
+        ):
             # Proxy is running — check if it has the features we need
             needs_restart = False
+            # Set False when the running proxy must not serve this session at
+            # all (routing-level mismatch with live clients attached): fall
+            # through to a fresh start on a different port.
+            reuse_running = True
             health_payload = helpers._query_proxy_health(port)
             running_config = helpers._proxy_health_config(health_payload)
             if running_config is None:
                 running_config = helpers._query_proxy_config(port)
+            if running_config is None and not helpers._proxy_needs_version_restart(health_payload):
+                # A proxy that exposes no config block cannot be checked for
+                # feature or routing compatibility, and without a reported PID
+                # it cannot be restarted either. Reusing it blindly is the
+                # silent-misrouting incident class; start a dedicated proxy on
+                # a free port instead (mirrors the persistent branch, which
+                # already treats config-unavailable as not-reusable).
+                click.echo(
+                    f"  Proxy on port {port} did not expose its config; "
+                    "starting a dedicated proxy on a different port instead of "
+                    "reusing it unchecked."
+                )
+                reuse_running = False
 
             if helpers._proxy_needs_version_restart(health_payload):
                 running_version = helpers._proxy_version(health_payload) or "unknown"
@@ -4318,7 +4419,59 @@ def _ensure_proxy_unlocked(
                             )
                             return None, port
 
-            if not needs_restart:
+                # Routing-level config (backend, upstream URLs) must match in
+                # both directions. Unlike missing feature flags, reusing a
+                # proxy that forwards to a backend/upstream the caller did not
+                # request is broken, not degraded, so "reuse as-is" is never an
+                # option here (cf. the factory-api-url fail-loud precedent on
+                # the droid branch and the tenant check in wrap auggie).
+                routing_mismatches = (
+                    []
+                    if needs_restart
+                    else helpers._proxy_routing_mismatches(
+                        running_config,
+                        backend=backend,
+                        requested_api_urls={
+                            "openai_api_url": openai_api_url,
+                            "anthropic_api_url": anthropic_api_url,
+                            "vertex_api_url": None if clear_vertex_api_url else vertex_api_url,
+                        },
+                    )
+                )
+                if routing_mismatches:
+                    keys_str = ", ".join(routing_mismatches)
+                    other_wrappers = helpers._live_proxy_clients(port, exclude_self=True)
+                    active_sessions = helpers._proxy_active_session_count(health_payload)
+                    if other_wrappers or active_sessions > 0:
+                        click.echo(
+                            f"  Proxy on port {port} has incompatible routing config "
+                            f"({keys_str}), but live session(s) are attached."
+                        )
+                        click.echo(
+                            "  Starting a dedicated proxy on a different port instead "
+                            "of reusing or disrupting it."
+                        )
+                        reuse_running = False
+                    else:
+                        click.echo(
+                            f"  Proxy on port {port} has incompatible routing config "
+                            f"({keys_str}); restarting with the requested config..."
+                        )
+                        proxy_pid = running_config.get("pid")
+                        if proxy_pid is None:
+                            raise click.ClickException(
+                                f"Proxy on port {port} has incompatible routing config "
+                                f"({keys_str}) but did not expose a PID. "
+                                "Stop it manually and retry."
+                            )
+                        if not helpers._kill_proxy_by_pid(int(proxy_pid), port):
+                            raise click.ClickException(
+                                f"Failed to stop incompatible proxy (PID {proxy_pid}) "
+                                f"on port {port}. Stop it manually and retry."
+                            )
+                        needs_restart = True
+
+            if not needs_restart and reuse_running:
                 click.echo(f"  Proxy already running on port {port}")
                 click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
                 return None, port
