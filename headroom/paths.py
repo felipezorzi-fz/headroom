@@ -73,7 +73,10 @@ _SAVINGS_EVENTS_FILE = "savings_events.jsonl"
 _SYNC_STATE_FILE = "sync_state.json"
 _BRIDGE_STATE_FILE = "bridge_state.json"
 _LOGS_DIR = "logs"
+# Legacy shared runtime-log filename. Kept only as the readers' backward-compat
+# fallback; live proxies now write per-port files (see ``proxy_log_path``).
 _PROXY_LOG_FILE = "proxy.log"
+_PROXY_STDIO_LOG_FILE = "proxy-stdio.log"
 _DEBUG_400_DIR = "debug_400"
 _CODEX_WIRE_DEBUG_DIR = "codex_wire"
 _BIN_DIR = "bin"
@@ -300,10 +303,29 @@ def log_dir() -> Path:
     return workspace_dir() / _LOGS_DIR
 
 
-def proxy_log_path() -> Path:
-    """Return the path for the proxy log file."""
+def proxy_log_path(port: int | None = None) -> Path:
+    """Return the path for the proxy runtime log file.
 
-    return log_dir() / _PROXY_LOG_FILE
+    Each live proxy writes its own ``proxy-<port>.log`` so that concurrent
+    instances (e.g. wrapped copilot, droid, and claude on different ports) do
+    not share a single ``RotatingFileHandler`` target and rotate each other's
+    history away. With *port* omitted the legacy shared ``proxy.log`` name is
+    returned, which the readers still honor as a backward-compat fallback.
+    """
+
+    name = f"proxy-{port}.log" if port is not None else _PROXY_LOG_FILE
+    return log_dir() / name
+
+
+def proxy_stdio_log_path(port: int | None = None) -> Path:
+    """Return the path for the proxy stdout/stderr capture file.
+
+    Per-port for the same reason as :func:`proxy_log_path`; the legacy
+    ``proxy-stdio.log`` name is used when *port* is omitted.
+    """
+
+    name = f"proxy-stdio-{port}.log" if port is not None else _PROXY_STDIO_LOG_FILE
+    return log_dir() / name
 
 
 def debug_400_dir() -> Path:
@@ -432,6 +454,7 @@ __all__ = [
     "bridge_state_path",
     "log_dir",
     "proxy_log_path",
+    "proxy_stdio_log_path",
     "debug_400_dir",
     "codex_wire_debug_dir",
     "bin_dir",
