@@ -16,6 +16,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
+from headroom.proxy.handlers.openai import OpenAIHandlerMixin
 from headroom.proxy.model_router import ModelRoute, ModelRouter, ModelRouterConfig
 from headroom.proxy.server import ProxyConfig, _proxy_config_from_env, create_app
 
@@ -264,3 +265,84 @@ def test_vertex_raw_predict_model_is_not_rewritten_in_body() -> None:
         )
     assert resp.status_code == 200
     assert "model" not in _forwarded_body(http)
+
+
+# ---------------------------------------------------------------------------
+# OpenAI paths (#1706 extended to chat/completions + Responses)
+# ---------------------------------------------------------------------------
+
+
+class _OpenAIRouterHost(OpenAIHandlerMixin):
+    """Minimal mixin host for OpenAI routing-only tests."""
+
+
+def _openai_router() -> ModelRouter:
+    return ModelRouter(
+        ModelRouterConfig(
+            enabled=True,
+            routes=(
+                ModelRoute(
+                    to_model="gpt-5.4-mini",
+                    max_input_tokens=100_000,
+                    require_no_tools=True,
+                    name="small",
+                ),
+            ),
+        )
+    )
+
+
+def test_maybe_route_openai_model_fails_closed_without_router() -> None:
+    host = _OpenAIRouterHost()
+    body = {"model": "gpt-5.4", "messages": [{"role": "user", "content": "hi"}]}
+    out = host._maybe_route_openai_model("gpt-5.4", body, bypass=False, request_id="r")
+    assert out == "gpt-5.4"
+    assert body["model"] == "gpt-5.4"
+
+
+def test_maybe_route_openai_model_routes_chat_messages() -> None:
+    host = _OpenAIRouterHost()
+    host.model_router = _openai_router()
+    body = {"model": "gpt-5.4", "messages": [{"role": "user", "content": "hi"}]}
+    out = host._maybe_route_openai_model("gpt-5.4", body, bypass=False, request_id="r")
+    assert out == "gpt-5.4-mini"
+    assert body["model"] == "gpt-5.4-mini"
+
+
+def test_maybe_route_openai_model_routes_responses_input() -> None:
+    host = _OpenAIRouterHost()
+    host.model_router = _openai_router()
+    body = {"model": "gpt-5.4", "input": [{"role": "user", "content": "hi"}]}
+    out = host._maybe_route_openai_model("gpt-5.4", body, bypass=False, request_id="r")
+    assert out == "gpt-5.4-mini"
+    assert body["model"] == "gpt-5.4-mini"
+
+
+def test_maybe_route_openai_model_skips_under_bypass() -> None:
+    host = _OpenAIRouterHost()
+    host.model_router = _openai_router()
+    body = {"model": "gpt-5.4", "messages": [{"role": "user", "content": "hi"}]}
+    out = host._maybe_route_openai_model("gpt-5.4", body, bypass=True, request_id="r")
+    assert out == "gpt-5.4"
+    assert body["model"] == "gpt-5.4"
+
+
+def test_maybe_route_openai_model_respects_require_no_tools() -> None:
+    host = _OpenAIRouterHost()
+    host.model_router = _openai_router()
+    body = {
+        "model": "gpt-5.4",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "f"}}],
+    }
+    out = host._maybe_route_openai_model("gpt-5.4", body, bypass=False, request_id="r")
+    # The require_no_tools rule must not match a tool-carrying request.
+    assert out == "gpt-5.4"
+    assert body["model"] == "gpt-5.4"
+
+
+def test_openai_handlers_delegate_to_maybe_route_openai_model() -> None:
+    chat_src = inspect.getsource(OpenAIHandlerMixin.handle_openai_chat)
+    resp_src = inspect.getsource(OpenAIHandlerMixin.handle_openai_responses)
+    assert "_maybe_route_openai_model(" in chat_src, "chat handler must apply model routing"
+    assert "_maybe_route_openai_model(" in resp_src, "responses handler must apply model routing"

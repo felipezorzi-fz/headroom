@@ -3225,6 +3225,47 @@ class OpenAIHandlerMixin:
             return (*result, timing)
         return result
 
+    def _maybe_route_openai_model(
+        self,
+        model: str,
+        body: dict[str, Any],
+        *,
+        bypass: bool,
+        request_id: str,
+    ) -> str:
+        """Apply cost-aware model routing (#1706) on the OpenAI paths.
+
+        The OpenAI counterpart of the Anthropic handler's ``_maybe_route_model``:
+        opt-in and disabled by default, fail-closed when no ``model_router`` is
+        present (alternate mixin hosts / test doubles never set it), and skipped
+        under bypass/passthrough so a byte-faithful request is never rewritten.
+        chat/completions carries the turn in ``messages`` (+ ``tools``);
+        Responses carries it in ``input`` (+ ``tools`` and top-level
+        ``instructions``). Mutating ``body["model"]`` in place is enough here —
+        the outbound request serializes ``body`` fresh, so no body-mutation
+        tracker is needed.
+        """
+        router = getattr(self, "model_router", None)
+        if router is None or not getattr(router, "enabled", False) or bypass:
+            return model
+
+        from headroom.proxy.model_router import estimate_input_tokens
+
+        turn = body.get("messages")
+        if turn is None:
+            turn = body.get("input")
+        system = body.get("system") or body.get("instructions")
+        decision = router.select(
+            model=model,
+            input_tokens=estimate_input_tokens(turn, body.get("tools"), system),
+            has_tools=bool(body.get("tools")),
+        )
+        logger.info("[%s] model routing decision: %s", request_id, decision.reason)
+        if not decision.changed:
+            return model
+        body["model"] = decision.routed_model
+        return decision.routed_model
+
     async def handle_openai_chat(
         self,
         request: Request,
@@ -3343,6 +3384,11 @@ class OpenAIHandlerMixin:
         _bypass = self._headroom_bypass_enabled(request.headers)
         if _bypass:
             logger.info(f"[{request_id}] Bypass: skipping compression (header)")
+
+        # Cost-aware model routing (#1706). Opt-in and disabled by default; runs
+        # before compression so the routed model drives tokenizer/limit
+        # selection, mirroring the Anthropic path. No-op under bypass.
+        model = self._maybe_route_openai_model(model, body, bypass=_bypass, request_id=request_id)
 
         # Image compression: tile alignment + ML-based technique routing.
         # Gated on ImageCompressionDecision — same value-type pattern
@@ -5361,6 +5407,18 @@ class OpenAIHandlerMixin:
                 "[%s] Responses passthrough reason=bypass_header mutation=disabled",
                 request_id,
             )
+
+        # Cost-aware model routing (#1706). Opt-in and disabled by default; runs
+        # before compression, mirroring the chat and Anthropic paths. The
+        # Responses forwarder gates re-serialization on the mutation tracker, so
+        # a model rewrite must mark it or an otherwise-unmutated request would be
+        # forwarded byte-faithfully and drop the routed model.
+        _routed_model = self._maybe_route_openai_model(
+            model, body, bypass=_bypass, request_id=request_id
+        )
+        if _routed_model != model:
+            body_mutation_tracker.mark_mutated("model_router")
+            model = _routed_model
 
         from headroom.proxy.helpers import capture_codex_wire_debug
 
