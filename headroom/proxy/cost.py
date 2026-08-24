@@ -1068,8 +1068,29 @@ class CostTracker:
             uncached = info.get("input_cost_per_token")
             if not uncached:
                 return None
-            cache_read = info.get("cache_read_input_token_cost", uncached)
-            cache_write = info.get("cache_creation_input_token_cost", uncached)
+            # LiteLLM carries explicit per-token cache prices for only a minority
+            # of its priced models; the long tail (most Bedrock, Mistral,
+            # Fireworks and OpenAI-compatible gateway models) omits them. The old
+            # ``.get(field, uncached)`` default billed those cache reads at the
+            # FULL uncached rate (and cache writes with no premium), so ``totals()``
+            # (and the /stats dollar figures it feeds) over-charged every cache-warm
+            # request on those models.
+            #
+            # Do NOT substitute a provider guess for a missing rate. Bedrock alone
+            # fronts Anthropic, Amazon, Meta, Mistral, Cohere and others whose cache
+            # economics are not interchangeable, and ``_CACHE_ECONOMICS`` is a
+            # coarse dashboard-savings convention, not per-model billing metadata.
+            # Fail closed instead: reconcile with the canonical
+            # ``litellm.cost_per_token`` path (the one ``estimate_cost`` uses),
+            # which books $0 for a cache slice LiteLLM cannot price, so ``totals()``
+            # agrees with the primary accounting rather than inventing a discount
+            # or a premium. Explicit LiteLLM cache fields still win.
+            cache_read = info.get("cache_read_input_token_cost")
+            cache_write = info.get("cache_creation_input_token_cost")
+            if cache_read is None:
+                cache_read = 0.0
+            if cache_write is None:
+                cache_write = 0.0
             return (cache_read, cache_write, uncached)
         except Exception:
             return None
