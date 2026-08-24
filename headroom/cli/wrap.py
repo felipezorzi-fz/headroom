@@ -7578,6 +7578,16 @@ def openclaw(
     is_flag=True,
     help="Route headroom/* models through the authenticated GitHub Copilot subscription",
 )
+@click.option(
+    "--openai-api-url",
+    default=None,
+    envvar="OPENAI_TARGET_API_URL",
+    help=(
+        "Upstream base URL for OpenAI-compatible traffic, e.g. "
+        "https://api.deepseek.com/v1. Without it the proxy forwards to "
+        "https://api.openai.com/v1 (env: OPENAI_TARGET_API_URL)."
+    ),
+)
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
 @click.option(
@@ -7595,6 +7605,7 @@ def opencode(
     code_graph: bool,
     no_proxy: bool,
     copilot_subscription: bool,
+    openai_api_url: str | None,
     learn: bool,
     memory: bool,
     backend: str | None,
@@ -7620,9 +7631,25 @@ def opencode(
         headroom wrap opencode --port 9999             # Custom proxy port
         headroom wrap opencode --backend anyllm --anyllm-provider groq
         headroom wrap opencode --copilot-subscription # Use a GitHub Copilot subscription
+        headroom wrap opencode --openai-api-url https://api.deepseek.com/v1
+
+    
+    Without --openai-api-url the proxy forwards OpenAI-compatible traffic to
+    https://api.openai.com/v1, so a third-party key (DeepSeek, Together,
+    OpenRouter, ...) is rejected upstream with OpenAI's 401 "Incorrect API key
+    provided". Point the proxy at the real upstream instead:
+
+    
+        headroom wrap opencode --openai-api-url https://api.deepseek.com/v1
+        OPENAI_TARGET_API_URL=https://api.deepseek.com/v1 headroom wrap opencode
     """
     subscription_resolution = None
     if copilot_subscription:
+        if openai_api_url:
+            raise click.ClickException(
+                "--openai-api-url cannot be combined with --copilot-subscription; "
+                "the subscription resolves its own upstream."
+            )
         effective_backend = backend or os.environ.get("HEADROOM_BACKEND")
         if effective_backend not in (None, "", "anthropic"):
             raise click.ClickException(
@@ -7716,7 +7743,9 @@ def opencode(
         backend=backend,
         anyllm_provider=anyllm_provider,
         region=region,
-        openai_api_url=(subscription_resolution.api_url if subscription_resolution else None),
+        openai_api_url=(
+            subscription_resolution.api_url if subscription_resolution else openai_api_url
+        ),
         copilot_api_token=(subscription_resolution.token if subscription_resolution else None),
         copilot_refresh_oauth_token=(
             subscription_resolution.refresh_oauth_token if subscription_resolution else None

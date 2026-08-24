@@ -1140,3 +1140,116 @@ def test_unwrap_opencode_preserves_utf8_user_content(
     assert "“smart quotes”" in content
     assert "—" in content
     assert wrap_mod._PROVIDER_MARKER_START not in content
+
+
+def _capture_ensure_proxy_kwargs(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    argv: list[str],
+) -> dict[str, object]:
+    """Run `wrap opencode` with a stubbed proxy/launch and return _ensure_proxy kwargs."""
+    monkeypatch.chdir(tmp_path)
+    _set_test_home(monkeypatch, tmp_path)
+    captured: dict[str, object] = {}
+
+    def fake_ensure_proxy(port: int, no_proxy: bool, **kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+        return None, port
+
+    with (
+        patch.object(wrap_mod.shutil, "which", return_value="opencode"),
+        patch.object(wrap_mod, "_ensure_proxy", side_effect=fake_ensure_proxy),
+        patch.object(wrap_mod, "_launch_tool"),
+    ):
+        result = runner.invoke(main, argv)
+
+    assert result.exit_code == 0, result.output
+    return captured
+
+
+def test_wrap_opencode_forwards_openai_api_url_to_proxy(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--openai-api-url points the proxy at a third-party OpenAI-compatible upstream (#3107)."""
+    monkeypatch.delenv("OPENAI_TARGET_API_URL", raising=False)
+    captured = _capture_ensure_proxy_kwargs(
+        runner,
+        monkeypatch,
+        tmp_path,
+        [
+            "wrap",
+            "opencode",
+            "--port",
+            "9000",
+            "--no-mcp",
+            "--no-serena",
+            "--openai-api-url",
+            "https://api.deepseek.com/v1",
+        ],
+    )
+
+    assert captured["openai_api_url"] == "https://api.deepseek.com/v1"
+
+
+def test_wrap_opencode_honors_openai_target_api_url_env(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OPENAI_TARGET_API_URL is honored without the flag, matching `headroom proxy`."""
+    monkeypatch.setenv("OPENAI_TARGET_API_URL", "https://api.deepseek.com/v1")
+    captured = _capture_ensure_proxy_kwargs(
+        runner,
+        monkeypatch,
+        tmp_path,
+        ["wrap", "opencode", "--port", "9000", "--no-mcp", "--no-serena"],
+    )
+
+    assert captured["openai_api_url"] == "https://api.deepseek.com/v1"
+
+
+def test_wrap_opencode_without_openai_api_url_leaves_upstream_unset(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No override means the proxy keeps its own default upstream resolution."""
+    monkeypatch.delenv("OPENAI_TARGET_API_URL", raising=False)
+    captured = _capture_ensure_proxy_kwargs(
+        runner,
+        monkeypatch,
+        tmp_path,
+        ["wrap", "opencode", "--port", "9000", "--no-mcp", "--no-serena"],
+    )
+
+    assert captured["openai_api_url"] is None
+
+
+def test_wrap_opencode_rejects_openai_api_url_with_copilot_subscription(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Copilot subscription resolves its own upstream; a manual override would fight it."""
+    monkeypatch.chdir(tmp_path)
+    _set_test_home(monkeypatch, tmp_path)
+    _clear_copilot_route_config(monkeypatch)
+    monkeypatch.delenv("OPENAI_TARGET_API_URL", raising=False)
+
+    with patch.object(wrap_mod, "_ensure_proxy", side_effect=AssertionError("proxy launched")):
+        result = runner.invoke(
+            main,
+            [
+                "wrap",
+                "opencode",
+                "--copilot-subscription",
+                "--openai-api-url",
+                "https://api.deepseek.com/v1",
+            ],
+        )
+
+    assert result.exit_code != 0
+    assert "cannot be combined with --copilot-subscription" in result.output
