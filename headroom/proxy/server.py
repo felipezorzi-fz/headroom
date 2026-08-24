@@ -157,6 +157,11 @@ from headroom.proxy.modes import (
     is_token_mode,
     normalize_proxy_mode,
 )
+from headroom.proxy.orphan_watchdog import (
+    orphan_grace_seconds,
+    orphan_watchdog_enabled,
+    orphan_watchdog_loop,
+)
 from headroom.proxy.probe_recorder import probe_recorder_from_env
 from headroom.proxy.project_context import (
     classify_project,
@@ -2665,6 +2670,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         app.state.startup_error = None
         app.state.periodic_toin_stats_task = None
         app.state.periodic_malloc_trim_task = None
+        app.state.orphan_watchdog_task = None
 
         try:
             try:
@@ -2680,6 +2686,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 if config.periodic_malloc_trim_enabled:
                     app.state.periodic_malloc_trim_task = asyncio.create_task(
                         trim_periodically(config.malloc_trim_interval_seconds)
+                    )
+                # Only wrap-spawned proxies carry the env marker; standalone
+                # `headroom proxy` and persistent installs never self-exit.
+                # Multi-worker runs (HEADROOM_PROXY_CONFIG_JSON is set before
+                # forking workers) are excluded: WS sessions are per-worker,
+                # so no single worker can observe "zero active sessions", and
+                # wrap never requests multiple workers anyway.
+                if orphan_watchdog_enabled() and _MULTI_WORKER_CONFIG_ENV not in os.environ:
+                    app.state.orphan_watchdog_task = asyncio.create_task(
+                        orphan_watchdog_loop(proxy, grace_seconds=orphan_grace_seconds()),
+                        name="headroom-orphan-watchdog",
                     )
                 if proxy.usage_reporter:
                     await proxy.usage_reporter.start(proxy)
@@ -2749,6 +2766,16 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     timeout=3.0,
                 )
                 app.state.periodic_malloc_trim_task = None
+
+            orphan_watchdog_task = app.state.orphan_watchdog_task
+            if orphan_watchdog_task is not None:
+                orphan_watchdog_task.cancel()
+                await _timed(
+                    asyncio.gather(orphan_watchdog_task, return_exceptions=True),
+                    label="orphan_watchdog.stop",
+                    timeout=3.0,
+                )
+                app.state.orphan_watchdog_task = None
 
             if _cc_reconciler is not None:
                 await _timed(_cc_reconciler.stop(), label="cc_reconciler.stop", timeout=3.0)
