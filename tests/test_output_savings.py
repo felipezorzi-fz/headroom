@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from headroom.proxy.output_savings import (
+    MEASURED_MIN_ARM_SAMPLES,
     BaselineModel,
     SavingsLedger,
     SavingsRecorder,
@@ -297,18 +298,18 @@ class TestEstimateFromHoldout:
 
     def test_only_strata_present_in_both_arms_contribute(self):
         ledger = SavingsLedger()
-        for _ in range(10):
+        for _ in range(MEASURED_MIN_ARM_SAMPLES):
             ledger.record("control", "opus|a|s|tools", 1000)
             ledger.record("treatment", "opus|a|s|tools", 800)
         # Treatment-only stratum must not contribute (no control to compare).
         ledger.record("treatment", "opus|b|m|notools", 50)
         est = ledger.estimate_from_holdout()
         assert est is not None
-        assert est.n_requests == 10
+        assert est.n_requests == MEASURED_MIN_ARM_SAMPLES
 
     def test_best_estimate_prefers_measured(self):
         ledger = SavingsLedger()
-        for _ in range(10):
+        for _ in range(MEASURED_MIN_ARM_SAMPLES):
             ledger.baseline.observe("opus|a|s|tools", 1000)
             ledger.record("control", "opus|a|s|tools", 1000)
             ledger.record("treatment", "opus|a|s|tools", 900)
@@ -321,6 +322,82 @@ class TestEstimateFromHoldout:
             ledger.record("treatment", "opus|a|s|tools", 900)
         assert ledger.best_estimate().kind == "estimated"
 
+    def test_a_thin_control_arm_does_not_take_over(self):
+        """The -1439.9% case: a few scattered control samples decide nothing."""
+        ledger = SavingsLedger()
+        for i in range(200):
+            ledger.baseline.observe("opus|a|s|tools", 1000 + i)
+            ledger.record("treatment", "opus|a|s|tools", 800 + i)
+        # Three control samples, spread wide enough to be worthless.
+        for value in (200, 1000, 5000):
+            ledger.record("control", "opus|a|s|tools", value)
+
+        assert ledger.estimate_from_holdout() is None, "three requests are not an arm"
+        assert ledger.best_estimate().kind == "estimated"
+
+    def test_a_single_control_observation_does_not_contribute(self):
+        """One control request passes both aggregate gates and must still lose.
+
+        Its arm reports variance 0, so the 95% band is zero-wide, and because
+        the stratum is the whole of the traffic its coverage is 100%. Only a
+        per-stratum sample floor catches it.
+        """
+        ledger = SavingsLedger()
+        for _ in range(200):
+            ledger.baseline.observe("opus|a|s|tools", 1000)
+            ledger.record("treatment", "opus|a|s|tools", 800)
+        ledger.record("control", "opus|a|s|tools", 1000)
+
+        assert ledger.estimate_from_holdout() is None
+        assert ledger.best_estimate().kind == "estimated"
+
+    def test_repeated_identical_control_observations_do_not_contribute(self):
+        """Identical samples report variance 0 too, however far off they are."""
+        ledger = SavingsLedger()
+        for _ in range(200):
+            ledger.baseline.observe("opus|a|s|tools", 1000)
+            ledger.record("treatment", "opus|a|s|tools", 800)
+        for _ in range(5):
+            ledger.record("control", "opus|a|s|tools", 200)
+
+        assert ledger.estimate_from_holdout() is None
+        assert ledger.best_estimate().kind == "estimated"
+
+    def test_a_wide_band_does_not_take_over_even_at_full_size(self):
+        """The width gate still bites once the sample floor is met."""
+        ledger = SavingsLedger()
+        for _ in range(200):
+            ledger.baseline.observe("opus|a|s|tools", 1000)
+            ledger.record("treatment", "opus|a|s|tools", 800)
+        for i in range(MEASURED_MIN_ARM_SAMPLES):
+            ledger.record("control", "opus|a|s|tools", (200, 1000, 5000)[i % 3])
+
+        measured = ledger.estimate_from_holdout()
+        assert measured is not None, "the arm is big enough to be estimated"
+        assert (measured.ci_high_pct - measured.ci_low_pct) / 2 > 10, "and too noisy to believe"
+        assert ledger.best_estimate().kind == "estimated"
+
+    def test_a_holdout_covering_a_corner_of_traffic_does_not_take_over(self):
+        ledger = SavingsLedger()
+        # One stratum measured cleanly, but it is a fraction of the traffic.
+        for _ in range(MEASURED_MIN_ARM_SAMPLES):
+            ledger.baseline.observe("opus|a|s|tools", 1000)
+            ledger.record("control", "opus|a|s|tools", 1000)
+            ledger.record("treatment", "opus|a|s|tools", 900)
+        for _ in range(200):
+            ledger.baseline.observe("opus|b|xl|tools", 4000)
+            ledger.record("treatment", "opus|b|xl|tools", 3000)
+        assert ledger.best_estimate().kind == "estimated"
+
+    def test_measured_wins_without_a_baseline_to_fall_back_on(self):
+        """A holdout-only deployment (no ``learn --verbosity`` run) still reports."""
+        ledger = SavingsLedger()
+        for _ in range(50):
+            ledger.record("control", "opus|a|s|tools", 1000)
+            ledger.record("treatment", "opus|a|s|tools", 800)
+        assert ledger.estimate_from_baseline().n_requests == 0
+        assert ledger.best_estimate().kind == "measured"
+
 
 # ---------------------------------------------------------------------------
 # persistence
@@ -330,9 +407,10 @@ class TestEstimateFromHoldout:
 class TestLedgerPersistence:
     def test_roundtrip(self, tmp_path):
         ledger = SavingsLedger()
-        ledger.baseline.observe("opus|a|s|tools", 1000)
-        ledger.record("treatment", "opus|a|s|tools", 800)
-        ledger.record("control", "opus|a|s|tools", 1000)
+        for _ in range(MEASURED_MIN_ARM_SAMPLES):
+            ledger.baseline.observe("opus|a|s|tools", 1000)
+            ledger.record("treatment", "opus|a|s|tools", 800)
+            ledger.record("control", "opus|a|s|tools", 1000)
         path = tmp_path / "savings.json"
         ledger.save(path)
         loaded = SavingsLedger.load(path)
